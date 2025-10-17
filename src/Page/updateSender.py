@@ -2,14 +2,9 @@ import requests
 
 SERVER_URL = "http://localhost:5000"
 
-def sendUpdate(info: str):
-    """Send status update to server."""
-    payload = {"update": info} 
-    
+def send_update(customerId, message,workerId):
+    payload = {"workerId": workerId, "customerId": customerId, "update": message}
     try:
-        response = requests.post(f"{SERVER_URL}/updates", json=payload)
-        data = response.json()
-        print(data.get("isReceived"))
-        response.raise_for_status()
+        requests.post(f"{SERVER_URL}/updates", json=payload)
     except requests.exceptions.RequestException as e:
-        print("Error sending update:", e)
+        print("⚠️ Update error:", e)

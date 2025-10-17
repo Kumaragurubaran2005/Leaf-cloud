@@ -1,10 +1,11 @@
 import docker
 import os
-from updateSender import sendUpdate
+from updateSender import send_update as sendUpdate
 
 def run_in_docker(
     folder_path: str,
     workerId: str,
+    customerId:str,
     code_file: str = "code_file.py",
     requirements_file: str = "requirements.txt",
     cpu_limit: float = 1.0,
@@ -18,7 +19,7 @@ def run_in_docker(
     Sends progress updates via sendUpdate().
     Returns the output as a dict: {"exit_code": int, "output": str}.
     """
-    sendUpdate("Docker initialized")
+    sendUpdate(customerId,"Docker initialized",workerId)
 
     # --- Validate folder ---
     abs_folder = os.path.abspath(folder_path)
@@ -26,7 +27,7 @@ def run_in_docker(
     if not os.path.isdir(abs_folder):
         raise ValueError(f"Folder '{abs_folder}' not found!")
     
-    sendUpdate(f"Validated folder: {abs_folder}")
+    sendUpdate(customerId,"Validated folder",workerId)
     
     try:
         client = docker.from_env()
@@ -35,12 +36,12 @@ def run_in_docker(
         print("Docker is not running or not accessible:", e)
         exit
     
-    sendUpdate("Docker client created")
+    sendUpdate(customerId,"Docker client created",workerId)
     
     # --- Mount folder inside container ---
     volumes = {abs_folder: {"bind": "/app", "mode": "rw"}}
     
-    sendUpdate("Mounted folder into container")
+    sendUpdate(customerId,"Mounted folder into container",workerId)
 
     # --- Build command ---
     commands = []
@@ -52,14 +53,14 @@ def run_in_docker(
             f"pip install --no-cache-dir -r /app/{requirements_file} > /dev/null 2>&1"
         )
     
-        sendUpdate("requirements.txt found — will install dependencies")
+        sendUpdate(customerId,"requirements.txt found — will install dependencies",workerId)
     else:
-        sendUpdate("No requirements.txt found — skipping dependency install")
+        sendUpdate(customerId,"No requirements.txt found — skipping dependency install",workerId)
 
     # Run main code file
     commands.append(f"python /app/{code_file}")
     final_command = " && ".join(commands)
-    sendUpdate(f"Prepared command: {final_command}")
+    sendUpdate(customerId,f"Prepared command: {final_command}",workerId)
 
     # --- Run Docker container ---
     try:
@@ -73,7 +74,7 @@ def run_in_docker(
             mem_limit=mem_limit,
             nano_cpus=int(cpu_limit * 1e9)
         )
-        sendUpdate("Container started")
+        sendUpdate(customerId,"Container started",workerId)
 
         # --- Capture logs in real-time ---
         logs = []
@@ -84,16 +85,16 @@ def run_in_docker(
         # Wait for container to finish
         result = container.wait()
         exit_code = result.get("StatusCode", -1)
-        sendUpdate(f"Docker execution completed with exit code {exit_code}")
+        sendUpdate(customerId,f"Docker execution completed with exit code {exit_code}",workerId)
 
     except docker.errors.DockerException as e:
-        sendUpdate(f"Docker error: {str(e)}")
+        sendUpdate(customerId,f"Docker error: {str(e)}",workerId)
         return {"exit_code": -1, "output": str(e)}
 
     finally:
         try:
             container.remove(force=True)
-            sendUpdate("Container removed")
+            sendUpdate(customerId,"Container removed",workerId)
         except Exception:
             pass
 

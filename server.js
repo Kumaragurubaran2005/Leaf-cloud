@@ -7,17 +7,6 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// -------------------- GLOBAL STATE --------------------
-let resourceId = [];          // Array of worker IDs who claimed task
-let update = "not started";   // Current update string
-let isTaskAvailable = false;  // Is there a task to do
-let noofrep = 1;              // Number of workers allowed
-let cusname;
-let customerIdentifier;
-// Heartbeat tracking
-let workerHeartbeats = {};
-const HEARTBEAT_TIMEOUT = 30000; // 30s timeout
-
 // -------------------- FILE STORAGE --------------------
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -44,14 +33,60 @@ async function runQuery(sql, binds = {}, options = {}) {
   }
 }
 
+// -------------------- IN-MEMORY TASK MANAGEMENT --------------------
+
+// Map to store customer tasks
+let customers = {};
+/*
+customers = {
+  [customerId]: {
+    cusname: "Alice",
+    files: { code, dataset, requirement },
+    numWorkers: 2,
+    workers: [],       // array of workerIds who claimed this task
+    results: {},       // workerId -> result buffer
+    pendingWorkers: 2
+  }
+}
+*/
+
+// Queue representing all pending worker slots
+let taskQueue = [];
+/*
+taskQueue = [
+  { customerId: "C123", taskId: "T1" },
+  { customerId: "C123", taskId: "T2" },
+  ...
+]
+*/
+
+const HEARTBEAT_TIMEOUT = 30000; // 30s heartbeat timeout
+
+// -------------------- HELPERS --------------------
+
+// Generate unique IDs using timestamp + random number
+function generateUniqueCustomerId() {
+  const now = Date.now();
+  const random = Math.floor(Math.random() * 1000);
+  return `C${now}${random}`;
+}
+
+function generateUniqueTaskId() {
+  const now = Date.now();
+  const random = Math.floor(Math.random() * 1000);
+  return `T${now}${random}`;
+}
+
 // -------------------- ROUTES --------------------
 
-// Server availability
+// Server availability check
 app.get("/areyouthere", (req, res) => {
   res.json({ iamthere: true });
 });
 
-// Upload files (dataset and requirement optional)
+// -------------------- CUSTOMER ROUTES --------------------
+
+// Upload task files
 app.post(
   "/sendingpackage",
   upload.fields([
@@ -61,182 +96,149 @@ app.post(
   ]),
   async (req, res) => {
     const files = req.files;
-    cusname = req.body.customername;
-    noofrep = parseInt(req.body.respn, 10) || 1;
-
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, "0");
-    const day = String(now.getDate()).padStart(2, "0");
-    const hours = String(now.getHours()).padStart(2, "0");
-    const minutes = String(now.getMinutes()).padStart(2, "0");
-    const seconds = String(now.getSeconds()).padStart(2, "0");
-    const milliseconds = String(now.getMilliseconds()).padStart(3, "0");
-
-    customerIdentifier = `${year}${month}${day}${hours}${minutes}${seconds}${milliseconds}`;
-    console.log("Customer ID:", customerIdentifier);
+    const cusname = req.body.customername;
+    const numWorkers = parseInt(req.body.respn, 10) || 1;
 
     if (!files.code) {
       return res.status(400).json({ message: "Code file is required" });
     }
 
+    // Generate unique customer ID
+    const customerId = generateUniqueCustomerId();
+
+    // Save customer task in memory
+    customers[customerId] = {
+      cusname,
+      files: {
+        code: files.code[0].buffer,
+        dataset: files.dataset ? files.dataset[0].buffer : null,
+        requirement: files.requirement ? files.requirement[0].buffer : null,
+      },
+      numWorkers,
+      workers: [],
+      results: {},
+      pendingWorkers: numWorkers,
+      workerHeartbeats: {},
+    };
+
+    // Push task slots into the queue (one per worker)
+    for (let i = 0; i < numWorkers; i++) {
+      const taskId = generateUniqueTaskId();
+      taskQueue.push({ customerId, taskId });
+    }
+
+    // Optional: save files to DB for persistence
     try {
       const sql = `
-        INSERT INTO files (code, dataset, requirement, customername, hint)
-        VALUES (:code, :dataset, :requirement, :cusname, :hint)
+        INSERT INTO files (customer_id, customername, code, dataset, requirement, num_workers)
+        VALUES (:customerId, :cusname, :code, :dataset, :requirement, :numWorkers)
       `;
-
       const bind = {
+        customerId,
         cusname,
         code: files.code[0].buffer,
         dataset: files.dataset ? files.dataset[0].buffer : null,
         requirement: files.requirement ? files.requirement[0].buffer : null,
-        hint: customerIdentifier,
+        numWorkers,
       };
-
-      const result = await runQuery(sql, bind, { autoCommit: true });
-      if (result.rowsAffected > 0) {
-        isTaskAvailable = true;
-        resourceId = []; // Reset previous workers for new task
-        update = "not started";
-        res.json({ received: true });
-      } else {
-        res.json({ received: false });
-      }
+      await runQuery(sql, bind, { autoCommit: true });
     } catch (err) {
-      console.error(err);
-      res.status(500).send(err.message);
+      console.error("DB insert error:", err.message);
     }
+
+    res.json({ customerId, message: "Task queued successfully" });
   }
 );
 
-// Worker asks if a task exists
+// Fetch results for a customer
+app.post("/getresults", (req, res) => {
+  const { customerId } = req.body;
+  const customerTask = customers[customerId];
+  if (!customerTask) return res.json({ response: "Customer task not found" });
+
+  const results = Object.entries(customerTask.results).map(([workerId, buffer]) => ({
+    workerId,
+    result: buffer.toString("base64"),
+  }));
+
+  res.json({ results });
+});
+
+// -------------------- WORKER ROUTES --------------------
+
+// Worker asks if a task is available
 app.get("/askfortask", (req, res) => {
-  res.json({ isTaskThere: isTaskAvailable });
+  res.json({ tasksAvailable: taskQueue.length > 0 });
 });
 
-// Worker tries to claim the task
-app.post("/iamin", (req, res) => {
-  const workerId = req.body.workerId;
+// Worker claims a task
+app.post("/gettask", (req, res) => {
+  const { workerId } = req.body;
 
-  if (resourceId.length < noofrep) {
-    resourceId.push(workerId);
-    return res.json({ isaccepted: true });
-  } else {
-    isTaskThere=false
-    return res.json({ isaccepted: false });
-    
-  }
+  if (taskQueue.length === 0) return res.json({ taskAvailable: false });
+
+  const task = taskQueue.shift();
+  const { customerId, taskId } = task;
+  const customerTask = customers[customerId];
+
+  // Assign worker to this task
+  customerTask.workers.push(workerId);
+  customerTask.workerHeartbeats[workerId] = Date.now();
+
+  res.json({
+    taskId,
+    customerId,
+    files: {
+      code: customerTask.files.code.toString("base64"),
+      dataset: customerTask.files.dataset?.toString("base64") || null,
+      requirement: customerTask.files.requirement?.toString("base64") || null,
+    },
+  });
 });
 
-// Worker heartbeat
+// Worker sends heartbeat
 app.post("/heartbeat", (req, res) => {
-  const { workerId } = req.body;
-  if (resourceId.includes(workerId)) {
-    workerHeartbeats[workerId] = Date.now();
-    return res.json({ ok: true });
-  }
-  res.json({ ok: false, message: "Not assigned to this task" });
+  const { workerId, customerId } = req.body;
+  const customerTask = customers[customerId];
+  if (!customerTask || !customerTask.workers.includes(workerId))
+    return res.json({ ok: false, message: "Not assigned to this task" });
+
+  customerTask.workerHeartbeats[workerId] = Date.now();
+  res.json({ ok: true });
 });
 
-// Send files to the chosen worker
-app.post("/getfiles", async (req, res) => {
-  const { workerId } = req.body;
-  if (!resourceId.includes(workerId)) {
-    return res.json({ response: "You are not authorized" });
-  }
+// Worker uploads result
+app.post("/uploadresult", upload.single("result"), (req, res) => {
+  const { workerId, customerId } = req.body;
+  const resultBuffer = req.file?.buffer;
 
-  try {
-    const sql = `
-      SELECT code, dataset, requirement
-      FROM files
-      WHERE customername = :cusname AND hint = :hint
-    `;
+  if (!resultBuffer) return res.status(400).json({ resp: false });
 
-    const options = {
-      fetchInfo: {
-        CODE: { type: oracledb.BUFFER },
-        DATASET: { type: oracledb.BUFFER },
-        REQUIREMENT: { type: oracledb.BUFFER },
-      },
-    };
+  const customerTask = customers[customerId];
+  if (!customerTask || !customerTask.workers.includes(workerId))
+    return res.status(400).json({ resp: false, message: "Not authorized" });
 
-    const result = await runQuery(sql, { cusname, hint: customerIdentifier }, options);
+  customerTask.results[workerId] = resultBuffer;
+  customerTask.pendingWorkers -= 1;
 
-    if (!result.rows || result.rows.length === 0) {
-      return res.json({ response: "No files found" });
-    }
-
-    const row = result.rows[0];
-    res.json({
-      code: row[0] ? row[0].toString("base64") : null,
-      dataset: row[1] ? row[1].toString("base64") : null,
-      requirement: row[2] ? row[2].toString("base64") : null,
-    });
-  } catch (err) {
-    console.error("Error fetching files:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Worker sends status updates
-app.post("/updates", (req, res) => {
-  update = req.body.update;
-  res.json({ isReceived: true });
-});
-
-// Client polls for updates
-app.get("/whatsTheupdate", (req, res) => {
-  res.json({ updates: update });
-});
-
-// Worker uploads result file
-app.post("/getresult", upload.single("result"), async (req, res) => {
-  const cusname = req.body.cusname;
-  if (!req.file || !cusname) {
-    return res.json({ resp: false });
-  }
-
-  try {
-    const sql = `INSERT INTO result_files (customername, result_file) VALUES (:cusname, :result)`;
-    const bind = { cusname, result: req.file.buffer };
-    const result = await runQuery(sql, bind);
-    res.json({ resp: result.rowsAffected > 0 });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err.message);
-  }
-});
-
-// Client fetches result
-app.post("/sendresult", async (req, res) => {
-  const { cusname } = req.body;
-
-  try {
-    const sql = `SELECT result_file FROM result_files WHERE customername = :cusname`;
-    const result = await runQuery(sql, { cusname }, { outFormat: oracledb.OUT_FORMAT_OBJECT });
-
-    if (result.rows.length === 0) {
-      return res.json({ response: "No result available" });
-    }
-
-    const file = result.rows[0].RESULT_FILE;
-    res.json({ result: file.toString("base64") });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err.message);
-  }
+  res.json({ resp: true, pendingWorkers: customerTask.pendingWorkers });
 });
 
 // -------------------- HEARTBEAT MONITOR --------------------
 setInterval(() => {
-  resourceId.forEach((workerId) => {
-    const lastBeat = workerHeartbeats[workerId];
-    if (lastBeat && Date.now() - lastBeat > HEARTBEAT_TIMEOUT) {
-      console.log(`⚠️ Worker ${workerId} missed heartbeat. Releasing lock.`);
-      resourceId = resourceId.filter((id) => id !== workerId);
-      delete workerHeartbeats[workerId];
-    }
+  Object.values(customers).forEach((task) => {
+    task.workers.forEach((workerId) => {
+      const lastBeat = task.workerHeartbeats[workerId];
+      if (lastBeat && Date.now() - lastBeat > HEARTBEAT_TIMEOUT) {
+        console.log(`⚠️ Worker ${workerId} missed heartbeat. Releasing slot.`);
+        task.workers = task.workers.filter((id) => id !== workerId);
+        delete task.workerHeartbeats[workerId];
+        task.pendingWorkers += 1;
+        // Optionally, push task back into queue for another worker
+        const taskId = generateUniqueTaskId();
+        taskQueue.push({ customerId: Object.keys(customers).find(key => customers[key] === task), taskId });
+      }
+    });
   });
 }, 5000);
 

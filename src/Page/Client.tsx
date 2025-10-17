@@ -1,5 +1,5 @@
 // Client.jsx
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 
 const Client = () => {
   const [code, setCode] = useState<File | null>(null);
@@ -12,7 +12,6 @@ const Client = () => {
   const [update, setUpdate] = useState<string>("");
 
   const updatesEndRef = useRef<HTMLDivElement | null>(null);
-
   const baseurl = "http://localhost:5000";
 
   // --- Check server availability ---
@@ -20,32 +19,30 @@ const Client = () => {
     try {
       const resp = await fetch(`${baseurl}/areyouthere`);
       const data = await resp.json();
-      if (data.iamthere) {
-        setServerLive(true);
-        alert("Server is live");
-      } else {
-        setServerLive(false);
-        alert(`Server responded with ${resp.status}`);
-      }
+      setServerLive(!!data.iamthere);
     } catch (err) {
       setServerLive(false);
       alert("Server not available");
     }
   };
 
-  // --- Fetch latest update from server ---
-  const fetchUpdate = async () => {
-    try {
-      const resp = await fetch(`${baseurl}/whatsTheupdate`);
-      const data = await resp.json();
-      setUpdate(data.update); // server should send { update: "..." }
-      // Auto-scroll
-      updatesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    } catch (err) {
-      console.error("Failed to fetch update:", err);
-      setUpdate("Failed to fetch update");
-    }
-  };
+  // --- Poll updates every 3 seconds ---
+  useEffect(() => {
+    if (!serverLive) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const resp = await fetch(`${baseurl}/whatsTheupdate`);
+        const data = await resp.json();
+        setUpdate(data.updates || "No updates yet");
+        updatesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      } catch (err) {
+        console.error("Polling failed:", err);
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [serverLive]);
 
   // --- Handle form submission ---
   const handleSubmit = async (e: React.FormEvent) => {
@@ -81,7 +78,18 @@ const Client = () => {
       xhr.onload = () => {
         setUploadProgress(0);
         if (xhr.status >= 200 && xhr.status < 300) {
-          alert("File sent successfully");
+          try {
+            const respData = JSON.parse(xhr.responseText);
+            if (respData.customerId) {
+              alert(`File sent successfully! Your Customer ID: ${respData.customerId}`);
+              console.log("Customer ID:", respData.customerId);
+            } else {
+              alert("File sent successfully, but no customer ID returned.");
+            }
+          } catch (err) {
+            alert("File sent, but failed to parse server response");
+            console.error(err);
+          }
         } else {
           alert(`Server error: ${xhr.status}`);
         }
@@ -122,7 +130,6 @@ const Client = () => {
 
       {/* Form */}
       <form onSubmit={handleSubmit} className="space-y-4">
-        {/* Code file */}
         <div>
           <label className="block mb-1 font-medium">Code file</label>
           <input
@@ -134,7 +141,6 @@ const Client = () => {
           {code && <p className="mt-1 text-sm text-gray-500">{code.name}</p>}
         </div>
 
-        {/* Dataset file */}
         <div>
           <label className="block mb-1 font-medium">Dataset file (optional)</label>
           <input
@@ -146,7 +152,6 @@ const Client = () => {
           {dataset && <p className="mt-1 text-sm text-gray-500">{dataset.name}</p>}
         </div>
 
-        {/* Requirement file */}
         <div>
           <label className="block mb-1 font-medium">Requirement file (optional)</label>
           <input
@@ -158,7 +163,6 @@ const Client = () => {
           {requirement && <p className="mt-1 text-sm text-gray-500">{requirement.name}</p>}
         </div>
 
-        {/* Customer name */}
         <div>
           <label className="block mb-1 font-medium">Customer Name</label>
           <input
@@ -170,7 +174,6 @@ const Client = () => {
           />
         </div>
 
-        {/* Response number */}
         <div>
           <label className="block mb-1 font-medium">Response Number</label>
           <input
@@ -182,7 +185,6 @@ const Client = () => {
           />
         </div>
 
-        {/* Upload progress */}
         {uploadProgress > 0 && (
           <div>
             <p className="text-sm mb-1">Upload Progress: {uploadProgress}%</p>
@@ -195,7 +197,6 @@ const Client = () => {
           </div>
         )}
 
-        {/* Buttons */}
         <div className="flex gap-4">
           <button
             type="submit"
@@ -212,14 +213,6 @@ const Client = () => {
             className="px-4 py-2 bg-gray-300 rounded hover:bg-gray-400 transition"
           >
             Debug: Show state
-          </button>
-          <button
-            type="button"
-            onClick={fetchUpdate}
-            disabled={!serverLive}
-            className="px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600 transition disabled:opacity-50"
-          >
-            Get Latest Update
           </button>
         </div>
       </form>
