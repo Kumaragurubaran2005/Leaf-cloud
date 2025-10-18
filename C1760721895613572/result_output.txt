@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-File "/app/code_file.py", line 1, in <module>
-from graphviz import Digraph
-ModuleNotFoundError: No module named 'graphviz'

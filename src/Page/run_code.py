@@ -20,6 +20,7 @@ def run_in_docker(
     Returns the output as a dict: {"exit_code": int, "output": str}.
     """
     sendUpdate(customerId,"Docker initialized",workerId)
+    
 
     # --- Validate folder ---
     abs_folder = os.path.abspath(folder_path)

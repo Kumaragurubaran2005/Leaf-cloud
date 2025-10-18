@@ -1,12 +1,15 @@
 import os
 import base64
 import requests
+import threading
 from time import sleep
 from run_code import run_in_docker  # Ensure this accepts workerId parameter
 from updateSender import send_update
+
 # -------------------- CONFIG --------------------
 workerId = "worker123"
 SERVER_URL = "http://localhost:5000"
+HEARTBEAT_INTERVAL = 5  # seconds
 
 # -------------------- FUNCTIONS --------------------
 
@@ -17,6 +20,19 @@ def send_heartbeat(customerId):
         requests.post(f"{SERVER_URL}/heartbeat", json=payload)
     except requests.exceptions.RequestException as e:
         print("⚠️ Heartbeat error:", e)
+
+# Start periodic heartbeat in background
+def start_heartbeat(customerId, interval=HEARTBEAT_INTERVAL):
+    stop_event = threading.Event()
+
+    def heartbeat_loop():
+        while not stop_event.is_set():
+            send_heartbeat(customerId)
+            sleep(interval)
+
+    thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    thread.start()
+    return stop_event  # call stop_event.set() to stop heartbeats
 
 # Check if server is available
 def check_server():
@@ -37,7 +53,7 @@ def claim_task():
         response.raise_for_status()
         data = response.json()
         if not data.get("taskId"):
-            return None, None,None
+            return None, None, None
         return data["customerId"], data["taskId"], data["files"]
     except requests.exceptions.RequestException as e:
         print("⚠️ Claim task error:", e)
@@ -79,6 +95,7 @@ def upload_result(customerId, result_file_path):
             response = requests.post(f"{SERVER_URL}/uploadresult", files=files, data=payload)
             response.raise_for_status()
             print("✅ Result uploaded successfully")
+            
         except requests.exceptions.RequestException as e:
             print("❌ Result upload failed:", e)
 
@@ -102,6 +119,9 @@ def main_worker():
         req_file_path = os.path.join(folder_path, "requirements.txt")
         has_requirements = os.path.exists(req_file_path)
 
+        # Start background heartbeat for this task
+        heartbeat_stop = start_heartbeat(customerId)
+
         print("🐳 Starting Docker execution...")
         try:
             result = run_in_docker(
@@ -116,7 +136,8 @@ def main_worker():
             print(f"✅ Docker execution finished. Exit code: {result['exit_code']}")
         except Exception as e:
             print(f"❌ Docker execution failed: {e}")
-            send_update(customerId, f"docker_failed: {e}",workerId)
+            send_update(customerId, f"docker_failed: {e}", workerId)
+            heartbeat_stop.set()  # stop heartbeats for this task
             continue
 
         # Save Docker output as result file
@@ -126,10 +147,10 @@ def main_worker():
 
         # Upload result to server
         upload_result(customerId, result_file_path)
-        send_update(customerId, "completed",workerId)
+        send_update(customerId, "completed", workerId)
 
-        # Send heartbeat one last time
-        send_heartbeat(customerId)
+        # Stop heartbeat after task finished
+        heartbeat_stop.set()
 
         print("✅ Task completed. Waiting for next task...")
         sleep(5)

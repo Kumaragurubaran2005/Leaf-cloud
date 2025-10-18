@@ -34,37 +34,13 @@ async function runQuery(sql, binds = {}, options = {}) {
 }
 
 // -------------------- IN-MEMORY TASK MANAGEMENT --------------------
-
-// Map to store customer tasks
-let customers = {};
-/*
-customers = {
-  [customerId]: {
-    cusname: "Alice",
-    files: { code, dataset, requirement },
-    numWorkers: 2,
-    workers: [],       // array of workerIds who claimed this task
-    results: {},       // workerId -> result buffer
-    pendingWorkers: 2
-  }
-}
-*/
-
-// Queue representing all pending worker slots
 let taskQueue = [];
-/*
-taskQueue = [
-  { customerId: "C123", taskId: "T1" },
-  { customerId: "C123", taskId: "T2" },
-  ...
-]
-*/
-
-const HEARTBEAT_TIMEOUT = 30000; // 30s heartbeat timeout
+let taskProgressQueue = [];
+let customers = {};
+let taskUpdate = [];
+const HEARTBEAT_TIMEOUT = 30000; // 30s
 
 // -------------------- HELPERS --------------------
-
-// Generate unique IDs using timestamp + random number
 function generateUniqueCustomerId() {
   const now = Date.now();
   const random = Math.floor(Math.random() * 1000);
@@ -85,8 +61,6 @@ app.get("/areyouthere", (req, res) => {
 });
 
 // -------------------- CUSTOMER ROUTES --------------------
-
-// Upload task files
 app.post(
   "/sendingpackage",
   upload.fields([
@@ -99,14 +73,11 @@ app.post(
     const cusname = req.body.customername;
     const numWorkers = parseInt(req.body.respn, 10) || 1;
 
-    if (!files.code) {
-      return res.status(400).json({ message: "Code file is required" });
-    }
+    if (!files.code) return res.status(400).json({ message: "Code file is required" });
 
-    // Generate unique customer ID
     const customerId = generateUniqueCustomerId();
+    const taskId = generateUniqueTaskId();
 
-    // Save customer task in memory
     customers[customerId] = {
       cusname,
       files: {
@@ -119,15 +90,16 @@ app.post(
       results: {},
       pendingWorkers: numWorkers,
       workerHeartbeats: {},
+      taskId,
+      customerId,
     };
 
     // Push task slots into the queue (one per worker)
     for (let i = 0; i < numWorkers; i++) {
-      const taskId = generateUniqueTaskId();
       taskQueue.push({ customerId, taskId });
     }
 
-    // Optional: save files to DB for persistence
+    // Optional: save files to Oracle DB
     try {
       const sql = `
         INSERT INTO files (customer_id, customername, code, dataset, requirement, num_workers)
@@ -150,7 +122,6 @@ app.post(
   }
 );
 
-// Fetch results for a customer
 app.post("/getresults", (req, res) => {
   const { customerId } = req.body;
   const customerTask = customers[customerId];
@@ -165,8 +136,6 @@ app.post("/getresults", (req, res) => {
 });
 
 // -------------------- WORKER ROUTES --------------------
-
-// Worker asks if a task is available
 app.get("/askfortask", (req, res) => {
   res.json({ tasksAvailable: taskQueue.length > 0 });
 });
@@ -178,10 +147,11 @@ app.post("/gettask", (req, res) => {
   if (taskQueue.length === 0) return res.json({ taskAvailable: false });
 
   const task = taskQueue.shift();
+  taskProgressQueue.push(task);
+
   const { customerId, taskId } = task;
   const customerTask = customers[customerId];
 
-  // Assign worker to this task
   customerTask.workers.push(workerId);
   customerTask.workerHeartbeats[workerId] = Date.now();
 
@@ -196,7 +166,24 @@ app.post("/gettask", (req, res) => {
   });
 });
 
-// Worker sends heartbeat
+app.post("/whatistheupdate", (req, res) => {
+  const { customerId, update } = req.body;
+  if (!customerId || !update) return res.status(400).json({ error: "customerId and update required" });
+  taskUpdate.push({ customerId, update });
+  res.json({ success: true });
+});
+
+app.post("/getUpdate", (req, res) => {
+  const { customerId } = req.body;
+  if (!customerId) return res.status(400).json({ error: "customerId is required" });
+
+  const updatesForCustomer = taskUpdate.filter(t => t.customerId === customerId);
+  taskUpdate = taskUpdate.filter(t => t.customerId !== customerId);
+  
+  res.json({ updates: updatesForCustomer.length > 0 ? updatesForCustomer : "No updates available" });
+});
+
+// Worker heartbeat
 app.post("/heartbeat", (req, res) => {
   const { workerId, customerId } = req.body;
   const customerTask = customers[customerId];
@@ -211,7 +198,6 @@ app.post("/heartbeat", (req, res) => {
 app.post("/uploadresult", upload.single("result"), (req, res) => {
   const { workerId, customerId } = req.body;
   const resultBuffer = req.file?.buffer;
-
   if (!resultBuffer) return res.status(400).json({ resp: false });
 
   const customerTask = customers[customerId];
@@ -221,22 +207,38 @@ app.post("/uploadresult", upload.single("result"), (req, res) => {
   customerTask.results[workerId] = resultBuffer;
   customerTask.pendingWorkers -= 1;
 
+  // If all workers finished, remove from taskProgressQueue
+  if (customerTask.pendingWorkers <= 0) {
+    taskProgressQueue = taskProgressQueue.filter(
+      t => !(t.customerId === customerId && t.taskId === customerTask.taskId)
+    );
+  }
+
   res.json({ resp: true, pendingWorkers: customerTask.pendingWorkers });
 });
 
 // -------------------- HEARTBEAT MONITOR --------------------
 setInterval(() => {
-  Object.values(customers).forEach((task) => {
-    task.workers.forEach((workerId) => {
-      const lastBeat = task.workerHeartbeats[workerId];
-      if (lastBeat && Date.now() - lastBeat > HEARTBEAT_TIMEOUT) {
+  const now = Date.now();
+
+  taskProgressQueue.forEach((task) => {
+    const customerTask = customers[task.customerId];
+    if (!customerTask) return;
+
+    customerTask.workers.forEach((workerId) => {
+      const lastBeat = customerTask.workerHeartbeats[workerId];
+      if (!lastBeat) return;
+
+      if (now - lastBeat > HEARTBEAT_TIMEOUT) {
         console.log(`⚠️ Worker ${workerId} missed heartbeat. Releasing slot.`);
-        task.workers = task.workers.filter((id) => id !== workerId);
-        delete task.workerHeartbeats[workerId];
-        task.pendingWorkers += 1;
-        // Optionally, push task back into queue for another worker
-        const taskId = generateUniqueTaskId();
-        taskQueue.push({ customerId: Object.keys(customers).find(key => customers[key] === task), taskId });
+
+        // Remove worker from task
+        customerTask.workers = customerTask.workers.filter(id => id !== workerId);
+        delete customerTask.workerHeartbeats[workerId];
+        customerTask.pendingWorkers += 1;
+
+        // Re-queue original task
+        taskQueue.push({ customerId: task.customerId, taskId: task.taskId });
       }
     });
   });
