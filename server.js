@@ -53,6 +53,17 @@ function generateUniqueTaskId() {
   return `T${now}${random}`;
 }
 
+function splitDataset(buffer, numParts) {
+  const chunkSize = Math.ceil(buffer.length / numParts);
+  const chunks = [];
+  for (let i = 0; i < numParts; i++) {
+    const start = i * chunkSize;
+    const end = start + chunkSize;
+    chunks.push(buffer.slice(start, end));
+  }
+  return chunks;
+}
+
 // -------------------- ROUTES --------------------
 
 // Server availability check
@@ -78,11 +89,21 @@ app.post(
     const customerId = generateUniqueCustomerId();
     const taskId = generateUniqueTaskId();
 
+    // Split dataset per worker
+    let datasetChunks = [];
+    if (files.dataset && numWorkers > 1) {
+      datasetChunks = splitDataset(files.dataset[0].buffer, numWorkers);
+    } else if (files.dataset) {
+      datasetChunks = [files.dataset[0].buffer];
+    } else {
+      datasetChunks = [null];
+    }
+
     customers[customerId] = {
       cusname,
       files: {
         code: files.code[0].buffer,
-        dataset: files.dataset ? files.dataset[0].buffer : null,
+        datasetChunks,
         requirement: files.requirement ? files.requirement[0].buffer : null,
       },
       numWorkers,
@@ -122,6 +143,7 @@ app.post(
   }
 );
 
+// Get results
 app.post("/getresults", (req, res) => {
   const { customerId } = req.body;
   const customerTask = customers[customerId];
@@ -140,10 +162,8 @@ app.get("/askfortask", (req, res) => {
   res.json({ tasksAvailable: taskQueue.length > 0 });
 });
 
-// Worker claims a task
 app.post("/gettask", (req, res) => {
   const { workerId } = req.body;
-
   if (taskQueue.length === 0) return res.json({ taskAvailable: false });
 
   const task = taskQueue.shift();
@@ -151,6 +171,9 @@ app.post("/gettask", (req, res) => {
 
   const { customerId, taskId } = task;
   const customerTask = customers[customerId];
+
+  const workerIndex = customerTask.workers.length;
+  const datasetChunk = customerTask.files.datasetChunks[workerIndex];
 
   customerTask.workers.push(workerId);
   customerTask.workerHeartbeats[workerId] = Date.now();
@@ -160,7 +183,7 @@ app.post("/gettask", (req, res) => {
     customerId,
     files: {
       code: customerTask.files.code.toString("base64"),
-      dataset: customerTask.files.dataset?.toString("base64") || null,
+      dataset: datasetChunk ? datasetChunk.toString("base64") : null,
       requirement: customerTask.files.requirement?.toString("base64") || null,
     },
   });
@@ -179,13 +202,17 @@ app.post("/getUpdate", (req, res) => {
 
   const updatesForCustomer = taskUpdate.filter(t => t.customerId === customerId);
   taskUpdate = taskUpdate.filter(t => t.customerId !== customerId);
-  
-  res.json({ updates: updatesForCustomer.length > 0 ? updatesForCustomer : "No updates available" });
+
+  res.json({ updates: updatesForCustomer.length > 0 ? updatesForCustomer : [] });
 });
 
-// Worker heartbeat
+// ✅ FIXED HEARTBEAT — supports idle heartbeats
 app.post("/heartbeat", (req, res) => {
   const { workerId, customerId } = req.body;
+
+  // Ignore idle heartbeats (no task)
+  if (customerId === "idle") return res.json({ ok: true });
+
   const customerTask = customers[customerId];
   if (!customerTask || !customerTask.workers.includes(workerId))
     return res.json({ ok: false, message: "Not assigned to this task" });
@@ -194,7 +221,7 @@ app.post("/heartbeat", (req, res) => {
   res.json({ ok: true });
 });
 
-// Worker uploads result
+// Upload result
 app.post("/uploadresult", upload.single("result"), (req, res) => {
   const { workerId, customerId } = req.body;
   const resultBuffer = req.file?.buffer;
@@ -207,7 +234,9 @@ app.post("/uploadresult", upload.single("result"), (req, res) => {
   customerTask.results[workerId] = resultBuffer;
   customerTask.pendingWorkers -= 1;
 
-  // If all workers finished, remove from taskProgressQueue
+  // ✅ Remove worker heartbeat after task is done
+  delete customerTask.workerHeartbeats[workerId];
+
   if (customerTask.pendingWorkers <= 0) {
     taskProgressQueue = taskProgressQueue.filter(
       t => !(t.customerId === customerId && t.taskId === customerTask.taskId)
@@ -220,7 +249,6 @@ app.post("/uploadresult", upload.single("result"), (req, res) => {
 // -------------------- HEARTBEAT MONITOR --------------------
 setInterval(() => {
   const now = Date.now();
-
   taskProgressQueue.forEach((task) => {
     const customerTask = customers[task.customerId];
     if (!customerTask) return;
@@ -232,12 +260,10 @@ setInterval(() => {
       if (now - lastBeat > HEARTBEAT_TIMEOUT) {
         console.log(`⚠️ Worker ${workerId} missed heartbeat. Releasing slot.`);
 
-        // Remove worker from task
         customerTask.workers = customerTask.workers.filter(id => id !== workerId);
         delete customerTask.workerHeartbeats[workerId];
         customerTask.pendingWorkers += 1;
 
-        // Re-queue original task
         taskQueue.push({ customerId: task.customerId, taskId: task.taskId });
       }
     });

@@ -1,4 +1,0 @@
-File "/app/code_file.py", line 1
-while(true)
-^
-SyntaxError: expected ':'
