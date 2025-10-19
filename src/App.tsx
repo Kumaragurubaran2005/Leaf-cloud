@@ -2,6 +2,7 @@
 import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import Client from "./Page/Client";
 import LoginPage from "./Page/login";
+import ResourceProviders from "./Page/Resourceproviders";
 
 function App() {
 
@@ -10,6 +11,7 @@ function App() {
         <Routes>
           <Route path="/" element={<LoginPage />} />
           <Route path="/client" element={<Client/>} />
+          <Route path="/Reso" element={<ResourceProviders/>} />
         </Routes>
       </Router>
     )

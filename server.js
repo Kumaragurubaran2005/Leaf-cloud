@@ -78,6 +78,36 @@ function authenticateJWT(req, res, next) {
   });
 }
 
+// -------------------- WORKER STATS HELPERS --------------------
+async function initWorkerStats(workerId) {
+  try {
+    await runQuery(
+      `MERGE INTO resource_provider rp
+       USING (SELECT :workerId AS workerId FROM dual) src
+       ON (rp.workerId = src.workerId)
+       WHEN NOT MATCHED THEN
+         INSERT (workerId, taskCompleted, taskPending, taskFailed, taskRunning)
+         VALUES (:workerId, 0, 0, 0, 0)`,
+      { workerId }
+    );
+  } catch (err) {
+    console.error("Error initializing worker stats:", err);
+  }
+}
+
+async function incrementWorkerStat(workerId, stat, value = 1) {
+  try {
+    await runQuery(
+      `UPDATE resource_provider
+       SET ${stat} = GREATEST(NVL(${stat},0) + :value, 0)
+       WHERE workerId = :workerId`,
+      { workerId, value }
+    );
+  } catch (err) {
+    console.error("Error updating worker stats:", err);
+  }
+}
+
 // -------------------- ROUTES --------------------
 
 // Server availability
@@ -165,8 +195,7 @@ app.post(
   }
 );
 
-// Get results (with usage)
-// Get combined results as ZIP
+// Get results (with usage) as ZIP
 app.get("/getresults/:customerId", authenticateJWT, (req, res) => {
   const { customerId } = req.params;
   const customerTask = customers[customerId];
@@ -176,7 +205,6 @@ app.get("/getresults/:customerId", authenticateJWT, (req, res) => {
   res.attachment(`results_${customerId}.zip`);
   archive.pipe(res);
 
-  // Add all results and usage files
   Object.keys(customerTask.results).forEach(workerId => {
     const resultBuffer = customerTask.results[workerId];
     const usageBuffer = customerTask.usage[workerId];
@@ -188,14 +216,13 @@ app.get("/getresults/:customerId", authenticateJWT, (req, res) => {
   archive.finalize();
 });
 
-
 // -------------------- WORKER ENDPOINTS --------------------
 
 // Check if tasks are available
 app.get("/askfortask", (req, res) => res.json({ tasksAvailable: taskQueue.length > 0 }));
 
 // Get a task
-app.post("/gettask", (req, res) => {
+app.post("/gettask", async (req, res) => {
   const { workerId } = req.body;
   if (!workerId) return res.status(400).json({ message: "workerId required" });
   if (taskQueue.length === 0) return res.json({ taskAvailable: false });
@@ -209,6 +236,12 @@ app.post("/gettask", (req, res) => {
 
   customerTask.workers.push(workerId);
   customerTask.workerHeartbeats[workerId] = Date.now();
+
+  // Initialize worker stats
+  await initWorkerStats(workerId);
+  // Increment taskPending and taskRunning
+  await incrementWorkerStat(workerId, "taskPending", 1);
+  await incrementWorkerStat(workerId, "taskRunning", 1);
 
   res.json({
     taskId: task.taskId,
@@ -224,55 +257,43 @@ app.post("/gettask", (req, res) => {
 // Upload result + usage
 app.post(
   "/uploadresult",
-  upload.fields([
-    { name: "result", maxCount: 1 },
-    { name: "usage", maxCount: 1 },
-  ]),
-  (req, res) => {
+  upload.fields([{ name: "result", maxCount: 1 }, { name: "usage", maxCount: 1 }]),
+  async (req, res) => {
     try {
       const { workerId, customerId } = req.body;
       const files = req.files;
 
       if (!workerId || !customerId)
-        return res
-          .status(400)
-          .json({ resp: false, message: "Missing workerId or customerId" });
+        return res.status(400).json({ resp: false, message: "Missing workerId or customerId" });
 
       if (!files || !files.result || !files.usage)
-        return res
-          .status(400)
-          .json({ resp: false, message: "Missing result or usage files" });
+        return res.status(400).json({ resp: false, message: "Missing result or usage files" });
 
       const customerTask = customers[customerId];
       if (!customerTask)
-        return res
-          .status(400)
-          .json({ resp: false, message: "Customer not found" });
+        return res.status(400).json({ resp: false, message: "Customer not found" });
 
       if (!customerTask.workers.includes(workerId))
-        return res
-          .status(403)
-          .json({ resp: false, message: "Worker not authorized" });
+        return res.status(403).json({ resp: false, message: "Worker not authorized" });
 
-      // Decrement pendingWorkers every time, but avoid negative
-      customerTask.pendingWorkers = Math.max(
-        customerTask.pendingWorkers - 1,
-        0
-      );
+      // Prevent double submission
+      if (customerTask.results[workerId]) {
+        return res.status(400).json({ resp: false, message: "Result already submitted" });
+      }
 
-      // Always update result & usage (overwrite if re-upload)
+      customerTask.pendingWorkers = Math.max(customerTask.pendingWorkers - 1, 0);
+
       customerTask.results[workerId] = files.result[0].buffer;
       customerTask.usage[workerId] = files.usage[0].buffer;
       delete customerTask.workerHeartbeats[workerId];
 
-      
-if (customerTask.pendingWorkers >=0) {
-  console.log(
-  `✅ Received result and usage from worker ${workerId} for customer ${customerId}`
-);
-  console.log(`Pending workers: ${customerTask.pendingWorkers}`);
-}
+      // Update stats: TASKCOMPLETED increments only once
+      await incrementWorkerStat(workerId, "taskCompleted", 1);
+      await incrementWorkerStat(workerId, "taskRunning", -1);
+      await incrementWorkerStat(workerId, "taskPending", -1);
 
+      console.log(`✅ Received result and usage from worker ${workerId} for customer ${customerId}`);
+      console.log(`Pending workers: ${customerTask.pendingWorkers}`);
 
       res.json({
         resp: true,
@@ -280,13 +301,10 @@ if (customerTask.pendingWorkers >=0) {
       });
     } catch (err) {
       console.error("❌ /uploadresult error:", err);
-      res
-        .status(500)
-        .json({ resp: false, message: "Internal server error" });
+      res.status(500).json({ resp: false, message: "Internal server error" });
     }
   }
 );
-
 
 // Heartbeat endpoint
 app.post("/heartbeat", (req, res) => {
@@ -303,19 +321,18 @@ app.post("/heartbeat", (req, res) => {
 });
 
 // -------------------- HEARTBEAT MONITOR --------------------
-setInterval(() => {
+setInterval(async () => {
   const now = Date.now();
-  taskProgressQueue.forEach(task => {
+  for (const task of taskProgressQueue) {
     const customerTask = customers[task.customerId];
-    if (!customerTask) return;
+    if (!customerTask) continue;
+    if (customerTask.pendingWorkers <= 0) continue;
 
-    // Skip completed tasks
-    if (customerTask.pendingWorkers <= 0) return;
+    for (const workerId of [...customerTask.workers]) {
+      // Skip workers who already submitted
+      if (!customerTask.workerHeartbeats[workerId]) continue;
 
-    customerTask.workers.forEach(workerId => {
       const lastBeat = customerTask.workerHeartbeats[workerId];
-      if (!lastBeat) return;
-
       if (now - lastBeat > HEARTBEAT_TIMEOUT) {
         console.log(`⚠️ Worker ${workerId} missed heartbeat. Releasing slot.`);
 
@@ -324,13 +341,17 @@ setInterval(() => {
         customerTask.pendingWorkers += 1;
 
         taskQueue.push({ customerId: task.customerId, taskId: task.taskId });
+
+        // Update worker stats: failed + running -1, pending -1
+        await incrementWorkerStat(workerId, "taskFailed", 1);
+        await incrementWorkerStat(workerId, "taskRunning", -1);
+        await incrementWorkerStat(workerId, "taskPending", -1);
       }
-    });
-  });
+    }
+  }
 }, 5000);
 
-
-// Get updates for a customer
+// -------------------- CUSTOMER UPDATES --------------------
 app.post("/getUpdate", (req, res) => {
   const { customerId } = req.body;
   if (!customerId) return res.status(400).json({ error: "customerId is required" });
@@ -343,15 +364,45 @@ app.post("/getUpdate", (req, res) => {
 
 app.post("/whatistheupdate", (req, res) => {
   const { customerId, update } = req.body;
-  if (!customerId || !update)
-    return res.status(400).json({ error: "customerId and update required" });
+  if (!customerId || !update) return res.status(400).json({ error: "customerId and update required" });
 
-  // Push the update into the global updates queue
   taskUpdates.push({ customerId, update });
-
   res.json({ success: true });
 });
 
+// -------------------- WORKER STATS ENDPOINT --------------------
+app.get("/workerstats/:workerId", async (req, res) => {
+  const { workerId } = req.params;
+  try {
+    const result = await runQuery(
+      `SELECT * FROM resource_provider WHERE workerId = :workerId`,
+      { workerId }
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Worker not found" });
+    res.json({ stats: result.rows[0] });
+  } catch (err) {
+    console.error("Error fetching worker stats:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/allworkerstats", async (req, res) => {
+  try {
+    const result = await runQuery(`SELECT * FROM resource_provider`);
+    res.json({
+      workers: result.rows.map((row) => ({
+        WORKERID: row[0],
+        TASKCOMPLETED: row[1],
+        TASKPENDING: row[2],
+        TASKFAILED: row[3],
+        TASKRUNNING: row[4],
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
 // -------------------- START SERVER --------------------
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));

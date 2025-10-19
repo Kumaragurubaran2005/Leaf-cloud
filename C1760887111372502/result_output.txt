@@ -1,0 +1,2 @@
+Fib(35) = 9227465
+Total time: 7.69 seconds
