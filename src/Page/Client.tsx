@@ -1,58 +1,51 @@
-// Client.tsx
-import React, { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 
-const Client = () => {
-  // File states
+const ClientPage = () => {
   const [code, setCode] = useState<File | null>(null);
   const [dataset, setDataset] = useState<File | null>(null);
   const [requirement, setRequirement] = useState<File | null>(null);
 
-  // Customer info
   const [customerName, setCustomerName] = useState("");
   const [responseNumber, setResponseNumber] = useState("");
   const [customerId, setCustomerId] = useState("");
-
-  // Server and progress states
   const [serverLive, setServerLive] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-
-  // Latest update state
   const [latestUpdate, setLatestUpdate] = useState("");
 
-  // Results from server
-  const [results, setResults] = useState<{ workerId: string; result: string }[]>([]);
-
   const baseurl = "http://localhost:5000";
+  const token = localStorage.getItem("authToken") || "";
 
-  // ---------------- SERVER CHECK ----------------
   const checkServerAvailability = async () => {
     try {
       const resp = await fetch(`${baseurl}/areyouthere`);
       const data = await resp.json();
       setServerLive(!!data.iamthere);
-    } catch (err) {
+    } catch {
       setServerLive(false);
       alert("Server not available");
     }
   };
 
-  // ---------------- POLL LATEST UPDATES ----------------
+  useEffect(() => {
+    checkServerAvailability();
+  }, []);
+
   useEffect(() => {
     if (!serverLive || !customerId) return;
-
     const interval = setInterval(async () => {
       try {
         const resp = await fetch(`${baseurl}/getUpdate`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
           body: JSON.stringify({ customerId }),
         });
-
         const data = await resp.json();
         if (Array.isArray(data.updates) && data.updates.length > 0) {
           const lastUpdate = data.updates[data.updates.length - 1].update;
           setLatestUpdate(lastUpdate);
-          console.log("Latest update:", lastUpdate);
         }
       } catch (err) {
         console.error("Polling failed:", err);
@@ -60,14 +53,11 @@ const Client = () => {
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [serverLive, customerId]);
+  }, [serverLive, customerId, token]);
 
-  // ---------------- SEND FILES ----------------
   const sendFile = async () => {
-    if (!serverLive) {
-      alert("Server is not live. Cannot send files.");
-      return;
-    }
+    if (!serverLive) return alert("Server is not live.");
+    if (!token) return alert("You must login first.");
 
     try {
       const files = new FormData();
@@ -79,170 +69,137 @@ const Client = () => {
 
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${baseurl}/sendingpackage`);
-
+      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const percent = Math.round((e.loaded / e.total) * 100);
-          setUploadProgress(percent);
-        }
+        if (e.lengthComputable) setUploadProgress(Math.round((e.loaded / e.total) * 100));
       };
-
       xhr.onload = () => {
         setUploadProgress(0);
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
             const respData = JSON.parse(xhr.responseText);
-            if (respData.customerId) {
-              alert(`File sent successfully! Customer ID: ${respData.customerId}`);
-              setCustomerId(respData.customerId);
-            } else {
-              alert("File sent successfully, but no customer ID returned.");
-            }
+            if (respData.customerId) setCustomerId(respData.customerId);
+            alert("Files sent successfully!");
           } catch (err) {
-            alert("File sent, but failed to parse server response");
             console.error(err);
           }
         } else {
-          alert(`Server error: ${xhr.status}`);
+          alert(`Upload failed: ${xhr.status}`);
         }
       };
-
-      xhr.onerror = () => {
-        setUploadProgress(0);
-        alert("Upload failed (network error)");
-      };
-
       xhr.send(files);
     } catch (err) {
       console.error(err);
-      alert("Failed to send files");
     }
   };
 
-  // ---------------- GET RESULTS ----------------
-  const getResults = async () => {
-    if (!customerId) {
-      alert("Please send files first to get a Customer ID.");
-      return;
-    }
-
+  // Download ZIP of all results & usage
+  const downloadResultsZip = async () => {
+    if (!customerId) return alert("Please send files first.");
     try {
-      const resp = await fetch(`${baseurl}/getresults`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ customerId }),
+      const resp = await fetch(`${baseurl}/getresults/${customerId}`, {
+        headers: { Authorization: `Bearer ${token}` },
       });
+      if (!resp.ok) throw new Error("Failed to fetch ZIP");
 
-      const data = await resp.json();
-      if (Array.isArray(data.results)) {
-        setResults(data.results);
-      } else {
-        alert("No results available yet.");
-      }
+      const blob = await resp.blob();
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `results_${customerId}.zip`;
+      link.click();
     } catch (err) {
       console.error(err);
-      alert("Failed to fetch results");
+      alert("Failed to download ZIP");
     }
   };
 
-  // ---------------- DOWNLOAD FILE ----------------
-  const downloadFile = (workerId: string, base64: string) => {
-    const link = document.createElement("a");
-    link.href = `data:text/plain;base64,${base64}`; // Use text/plain
-    link.download = `result_${workerId}.txt`; // Save as .txt
-    link.click();
-  };
-
-
-  // ---------------- RENDER ----------------
   return (
-    <div className="max-w-3xl mx-auto p-6 bg-white shadow-lg rounded-lg mt-8">
-      <h2 className="text-2xl font-bold mb-6 text-center">Send Package</h2>
+    <div className="min-h-screen flex items-center justify-center bg-white">
+      <div className="relative w-full max-w-3xl bg-white/60 backdrop-blur-md rounded-3xl p-10 shadow-2xl border border-gray-200/30 hover:shadow-3xl transition-all duration-300">
+        <h2 className="text-3xl font-semibold text-gray-900 text-center mb-8">Send Package</h2>
 
-      {/* Server Status */}
-      <div className="flex items-center mb-6 gap-4">
-        <button
-          onClick={checkServerAvailability}
-          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition"
-        >
-          Check Server
-        </button>
-        <span className={`font-semibold ${serverLive ? "text-green-600" : "text-red-600"}`}>
-          {serverLive ? "Server: live" : "Server: unknown"}
-        </span>
-      </div>
-
-      {/* File Upload Form */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          sendFile();
-        }}
-        className="space-y-4"
-      >
-        <div>
-          <label>Code file</label>
-          <input type="file" accept=".js,.py,.txt,.zip" onChange={(e) => setCode(e.target.files?.[0] ?? null)} />
-        </div>
-
-        <div>
-          <label>Dataset file (optional)</label>
-          <input type="file" accept=".csv,.json,.zip" onChange={(e) => setDataset(e.target.files?.[0] ?? null)} />
-        </div>
-
-        <div>
-          <label>Requirement file (optional)</label>
-          <input type="file" accept=".txt,.pdf,.doc,.docx" onChange={(e) => setRequirement(e.target.files?.[0] ?? null)} />
-        </div>
-
-        <div>
-          <label>Customer Name</label>
-          <input type="text" value={customerName} onChange={(e) => setCustomerName(e.target.value)} />
-        </div>
-
-        <div>
-          <label>Response Number</label>
-          <input type="text" value={responseNumber} onChange={(e) => setResponseNumber(e.target.value)} />
-        </div>
-
-        {uploadProgress > 0 && <p>Upload Progress: {uploadProgress}%</p>}
-
-        <div className="flex gap-4">
-          <button type="submit" disabled={!serverLive} className="px-4 py-2 bg-green-500 text-white rounded">
-            Send Files
+        {/* Server Status */}
+        <div className="flex items-center justify-between mb-6 p-4 bg-gray-50/50 rounded-xl border border-gray-200/40 shadow-sm">
+          <button
+            onClick={checkServerAvailability}
+            className="px-5 py-2 bg-blue-600 text-white rounded-xl shadow-lg hover:bg-blue-700 hover:scale-105 transition transform"
+          >
+            Check Server
           </button>
-          <button type="button" onClick={getResults} className="px-4 py-2 bg-indigo-500 text-white rounded">
-            Get Results
-          </button>
+          <span className={`font-medium ${serverLive ? "text-green-600" : "text-red-600"}`}>
+            {serverLive ? "Server: Live" : "Server: Unknown"}
+          </span>
         </div>
-      </form>
 
-      {/* Latest Server Update */}
-      <div className="mt-8">
-        <h3>Latest Update:</h3>
-        <p>{latestUpdate || "No updates yet."}</p>
+        {/* Form */}
+        <form onSubmit={(e) => { e.preventDefault(); sendFile(); }} className="space-y-5">
+          {["Code", "Dataset (Optional)", "Requirement (Optional)"].map((label, idx) => (
+            <div key={idx} className="space-y-3">
+              <label className="font-medium text-gray-700">{label} File</label>
+              <input
+                type="file"
+                accept={
+                  label.includes("Code") ? ".js,.py,.txt,.zip" :
+                  label.includes("Dataset") ? ".csv,.json,.zip" : ".txt,.pdf,.doc,.docx"
+                }
+                onChange={(e) =>
+                  idx === 0 ? setCode(e.target.files?.[0] ?? null) :
+                  idx === 1 ? setDataset(e.target.files?.[0] ?? null) :
+                  setRequirement(e.target.files?.[0] ?? null)
+                }
+                className="w-full p-3 border border-gray-300 rounded-xl hover:border-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-300 transition"
+              />
+            </div>
+          ))}
+
+          {["Customer Name", "Response Number"].map((label, idx) => (
+            <div key={idx} className="space-y-3">
+              <label className="font-medium text-gray-700">{label}</label>
+              <input
+                type="text"
+                value={idx === 0 ? customerName : responseNumber}
+                onChange={(e) => idx === 0 ? setCustomerName(e.target.value) : setResponseNumber(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-xl hover:border-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-300 transition"
+              />
+            </div>
+          ))}
+
+          {uploadProgress > 0 && (
+            <div className="w-full bg-gray-200/30 h-3 rounded-xl overflow-hidden">
+              <div
+                className="bg-blue-600 h-3 transition-all duration-300 rounded-xl"
+                style={{ width: `${uploadProgress}%` }}
+              ></div>
+            </div>
+          )}
+
+          <div className="flex gap-4 justify-center mt-3">
+            <button
+              type="submit"
+              disabled={!serverLive}
+              className="px-6 py-3 bg-green-600 text-white font-medium rounded-xl shadow-lg hover:bg-green-700 hover:scale-105 transition transform disabled:opacity-50"
+            >
+              Send Files
+            </button>
+            <button
+              type="button"
+              onClick={downloadResultsZip}
+              className="px-6 py-3 bg-indigo-600 text-white font-medium rounded-xl shadow-lg hover:bg-indigo-700 hover:scale-105 transition transform"
+            >
+              Download All Results (ZIP)
+            </button>
+          </div>
+
+        </form>
+
+        {/* Latest Update */}
+        <div className="mt-10 p-4 bg-gray-50/50 rounded-xl border border-gray-200/40 shadow-sm">
+          <h3 className="font-semibold text-gray-800 mb-2">Latest Update:</h3>
+          <p className="text-gray-600">{latestUpdate || "No updates yet."}</p>
+        </div>
       </div>
-
-      {/* Results */}
-      {results.length > 0 && (
-        <div className="mt-6">
-          <h3>Results:</h3>
-          <ul className="space-y-2">
-            {results.map((r) => (
-              <li key={r.workerId}>
-                <button
-                  onClick={() => downloadFile(r.workerId, r.result)}
-                  className="px-3 py-1 bg-green-500 text-white rounded hover:bg-green-600 transition"
-                >
-                  Download result from {r.workerId}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
     </div>
   );
 };
 
-export default Client;
+export default ClientPage;

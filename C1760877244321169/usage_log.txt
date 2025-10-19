@@ -1,0 +1,15 @@
+timestamp: 2025-10-19 18:04:09
+cpu_percent: 0.0
+mem_usage_MB: 4.7
+mem_percent: 0.92
+
+timestamp: 2025-10-19 18:04:10
+cpu_percent: 5.0
+mem_usage_MB: 45.21
+mem_percent: 8.83
+
+timestamp: 2025-10-19 18:04:11
+cpu_percent: 1.65
+mem_usage_MB: 55.38
+mem_percent: 10.82
+

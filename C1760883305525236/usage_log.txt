@@ -1,0 +1,45 @@
+timestamp: 2025-10-19 19:45:09
+cpu_percent: 0.0
+mem_usage_MB: 4.59
+mem_percent: 0.9
+
+timestamp: 2025-10-19 19:45:10
+cpu_percent: 4.99
+mem_usage_MB: 139.93
+mem_percent: 27.33
+
+timestamp: 2025-10-19 19:45:11
+cpu_percent: 4.73
+mem_usage_MB: 161.27
+mem_percent: 31.5
+
+timestamp: 2025-10-19 19:45:12
+cpu_percent: 5.05
+mem_usage_MB: 161.27
+mem_percent: 31.5
+
+timestamp: 2025-10-19 19:45:13
+cpu_percent: 5.06
+mem_usage_MB: 161.02
+mem_percent: 31.45
+
+timestamp: 2025-10-19 19:45:14
+cpu_percent: 4.98
+mem_usage_MB: 160.81
+mem_percent: 31.41
+
+timestamp: 2025-10-19 19:45:15
+cpu_percent: 4.95
+mem_usage_MB: 160.62
+mem_percent: 31.37
+
+timestamp: 2025-10-19 19:45:16
+cpu_percent: 4.87
+mem_usage_MB: 160.51
+mem_percent: 31.35
+
+timestamp: 2025-10-19 19:45:17
+cpu_percent: 0.0
+mem_usage_MB: 0.0
+mem_percent: 0.0
+

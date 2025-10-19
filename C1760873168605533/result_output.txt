@@ -1,5 +1,0 @@
-Traceback (most recent call last):
-File "/app/code_file.py", line 1, in <module>
-import requests  # External library (must be installed)
-^^^^^^^^^^^^^^^
-ModuleNotFoundError: No module named 'requests'
