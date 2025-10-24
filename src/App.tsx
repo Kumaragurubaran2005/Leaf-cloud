@@ -11,7 +11,7 @@ function App() {
         <Routes>
           <Route path="/" element={<LoginPage />} />
           <Route path="/client" element={<Client/>} />
-          <Route path="/Reso" element={<ResourceProviders/>} />
+          <Route path="/resource_provider" element={<ResourceProviders/>} />
         </Routes>
       </Router>
     )

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import axios from "axios";
 
 interface WorkerStats {
@@ -10,28 +10,21 @@ interface WorkerStats {
 }
 
 const ResourceProviders = () => {
-  const [workers, setWorkers] = useState<WorkerStats[]>([]);
+  const [workers, setWorkers] = useState<WorkerStats>();
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>("");
 
+  const workerId = localStorage.getItem("username")
   // Fetch worker stats
   const fetchWorkerStats = async () => {
   setLoading(true);
   setError("");
   try {
-    const response = await axios.get<{ workers: WorkerStats[] }>(
-      "http://localhost:5000/allworkerstats"
-    );
+    const response = await axios.post<WorkerStats>("http://localhost:5000/workerstats", { workerId });
 
-    const sanitizedWorkers = (response.data.workers || []).map((worker) => ({
-      ...worker,
-      TASKCOMPLETED: Math.max(worker.TASKCOMPLETED, 0),
-      TASKPENDING: Math.max(worker.TASKPENDING, 0),
-      TASKRUNNING: Math.max(worker.TASKRUNNING, 0),
-      TASKFAILED: Math.max(worker.TASKFAILED, 0),
-    }));
+    setWorkers(response.data)  
 
-    setWorkers(sanitizedWorkers);
+
   } catch (err: any) {
     console.error(err);
     setError("Failed to fetch worker stats");
@@ -62,9 +55,9 @@ const ResourceProviders = () => {
 
       {loading && <div>Loading worker stats...</div>}
       {error && <div className="text-red-600 mb-4">{error}</div>}
-      {!loading && workers.length === 0 && <div>No workers found.</div>}
+      {!loading && workers?.WORKERID===null && <div>No workers found.</div>}
 
-      {workers.length > 0 && (
+      {workers && (
         <table className="min-w-full border border-gray-300">
           <thead className="bg-gray-100">
             <tr>
@@ -76,15 +69,15 @@ const ResourceProviders = () => {
             </tr>
           </thead>
           <tbody>
-            {workers.map((worker) => (
-              <tr key={worker.WORKERID} className="text-center hover:bg-gray-50">
-                <td className="border px-4 py-2">{worker.WORKERID}</td>
-                <td className="border px-4 py-2">{worker.TASKCOMPLETED}</td>
-                <td className="border px-4 py-2">{worker.TASKPENDING}</td>
-                <td className="border px-4 py-2">{worker.TASKRUNNING}</td>
-                <td className="border px-4 py-2">{worker.TASKFAILED}</td>
+            
+              <tr key={workers.WORKERID} className="text-center hover:bg-gray-50">
+                <td className="border px-4 py-2">{workers.WORKERID}</td>
+                <td className="border px-4 py-2">{workers.TASKCOMPLETED}</td>
+                <td className="border px-4 py-2">{workers.TASKPENDING}</td>
+                <td className="border px-4 py-2">{workers.TASKRUNNING}</td>
+                <td className="border px-4 py-2">{workers.TASKFAILED}</td>
               </tr>
-            ))}
+            
           </tbody>
         </table>
       )}

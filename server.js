@@ -119,10 +119,12 @@ app.post("/login", async (req, res) => {
   try {
     const sql =
       "SELECT * FROM users WHERE TRIM(username)=TRIM(:username) AND TRIM(password)=TRIM(:password)";
+    console.log(username+password)
     const result = await runQuery(sql, { username, password });
+    console.log(result)
     if (result.rows.length > 0) {
       const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
-      return res.json({ success: true, token, message: "Login successful" });
+      return res.json({ success: true, token, message: "Login successful",togo: result.rows[0][2] });
     }
     res.status(401).json({ success: false, message: "Invalid username or password" });
   } catch (err) {
@@ -262,7 +264,6 @@ app.post(
     try {
       const { workerId, customerId } = req.body;
       const files = req.files;
-
       if (!workerId || !customerId)
         return res.status(400).json({ resp: false, message: "Missing workerId or customerId" });
 
@@ -358,14 +359,12 @@ app.post("/getUpdate", (req, res) => {
 
   const updatesForCustomer = taskUpdates.filter(t => t.customerId === customerId);
   taskUpdates = taskUpdates.filter(t => t.customerId !== customerId);
-
   res.json({ updates: updatesForCustomer.length > 0 ? updatesForCustomer : [] });
 });
 
 app.post("/whatistheupdate", (req, res) => {
   const { customerId, update } = req.body;
   if (!customerId || !update) return res.status(400).json({ error: "customerId and update required" });
-
   taskUpdates.push({ customerId, update });
   res.json({ success: true });
 });
@@ -386,18 +385,20 @@ app.get("/workerstats/:workerId", async (req, res) => {
   }
 });
 
-app.get("/allworkerstats", async (req, res) => {
+app.post("/workerstats", async (req, res) => {
+  const {workerId} = req.body
+  
   try {
-    const result = await runQuery(`SELECT * FROM resource_provider`);
+    const sql =`SELECT * FROM resource_provider where workerId=Trim(:workerId)`;
+    const bind = {workerId};
+    const result = await runQuery(sql,bind);
     res.json({
-      workers: result.rows.map((row) => ({
-        WORKERID: row[0],
-        TASKCOMPLETED: row[1],
-        TASKPENDING: row[2],
-        TASKFAILED: row[3],
-        TASKRUNNING: row[4],
-      })),
-    });
+        WORKERID: result.rows[0][0],
+        TASKCOMPLETED: result.rows[0][1],
+        TASKPENDING: result.rows[0][2],
+        TASKFAILED: result.rows[0][3],
+        TASKRUNNING: result.rows[0][4]
+      })
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });

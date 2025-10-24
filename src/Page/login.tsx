@@ -26,7 +26,10 @@ const LoginPage = () => {
 
       if (data.success && data.token) {
         localStorage.setItem("authToken", data.token);
-        navigate("/client");
+        localStorage.setItem("username",username);
+        if(data.togo === "client") {navigate("/client");}
+        else if(data.togo === "resource_provider") {navigate("/resource_provider");}
+        
       } else {
         setError(data.message || "Invalid credentials");
       }

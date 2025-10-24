@@ -102,6 +102,7 @@ def upload_result(customerId, workerId, result_file_path, usage_file_path):
 
 # -------------------- MAIN LOOP --------------------
 def main_worker():
+    global customerId
     while True:
         if not check_server():
             print("⚠️ Server not available. Retrying in 5s...")
