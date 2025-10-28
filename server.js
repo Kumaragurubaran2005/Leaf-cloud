@@ -17,7 +17,7 @@ const upload = multer({ storage });
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const JWT_EXPIRES_IN = "2h";
-
+const canceltask = false;
 const dbConfig = {
   user: process.env.DB_USER || "APPUSER",
   password: process.env.DB_PASSWORD || "2005",
@@ -131,6 +131,40 @@ app.post("/login", async (req, res) => {
     console.error(err);
     res.status(500).json({ success: false, message: "Server error" });
   }
+});
+
+
+// --------------------- CANCEL TASK ---------------------------
+let cancelMap = {}; // { customerId: true/false }
+
+// Customer requests cancellation
+app.post("/cancel", authenticateJWT, (req, res) => {
+  const { customerId } = req.body;
+  if (!customerId) return res.status(400).json({ message: "customerId required" });
+
+  cancelMap[customerId] = true;
+
+  // Remove from taskQueue if pending
+  taskQueue = taskQueue.filter(t => t.customerId !== customerId);
+
+  // Mark all workers for that task as canceled
+  const customerTask = customers[customerId];
+  if (customerTask) {
+    customerTask.pendingWorkers = 0;
+    taskUpdates.push({ customerId, update: "Task cancelled by user." });
+  }
+
+  console.log(`🛑 Customer ${customerId} cancelled their task.`);
+  res.json({ success: true, message: "Task cancelled successfully." });
+});
+
+// Worker checks if its task is cancelled
+app.get("/canceltask", (req, res) => {
+  const { customerId, workerId } = req.query;
+  if (!customerId) return res.status(400).json({ message: "customerId required" });
+
+  const isCancelled = cancelMap[customerId] === true;
+  res.json({ cancel: isCancelled });
 });
 
 // -------------------- CUSTOMER ENDPOINTS --------------------
