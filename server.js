@@ -81,6 +81,51 @@ function splitDataset(buffer, numParts) {
   return chunks;
 }
 
+// Parse usage data from buffer
+function parseUsageData(usageBuffer) {
+  try {
+    const usageText = usageBuffer.toString();
+    const lines = usageText.split('\n');
+    const usageData = {
+      cpu: 0,
+      memory: 0,
+      executionTime: 0,
+      timestamp: new Date().toISOString(),
+      rawData: usageText
+    };
+
+    lines.forEach(line => {
+      if (line.includes('CPU Usage:')) {
+        const cpuMatch = line.match(/CPU Usage:\s*([\d.]+)%/);
+        if (cpuMatch) usageData.cpu = parseFloat(cpuMatch[1]);
+      }
+      if (line.includes('Memory Usage:')) {
+        const memoryMatch = line.match(/Memory Usage:\s*([\d.]+)\s*MB/);
+        if (memoryMatch) usageData.memory = parseFloat(memoryMatch[1]);
+      }
+      if (line.includes('Execution Time:')) {
+        const timeMatch = line.match(/Execution Time:\s*([\d.]+)\s*seconds/);
+        if (timeMatch) usageData.executionTime = parseFloat(timeMatch[1]);
+      }
+      if (line.includes('Timestamp:')) {
+        const timestampMatch = line.match(/Timestamp:\s*(.+)/);
+        if (timestampMatch) usageData.timestamp = timestampMatch[1].trim();
+      }
+    });
+
+    return usageData;
+  } catch (error) {
+    console.error("Error parsing usage data:", error);
+    return {
+      cpu: 0,
+      memory: 0,
+      executionTime: 0,
+      timestamp: new Date().toISOString(),
+      rawData: usageBuffer.toString()
+    };
+  }
+}
+
 // Check if all results are available for a customer
 function areAllResultsAvailable(customerId) {
   const customerTask = customers[customerId];
@@ -210,6 +255,35 @@ async function incrementWorkerStat(workerId, stat, value = 1) {
   }
 }
 
+// -------------------- USAGE DATA STORAGE --------------------
+async function storeWorkerUsage(workerId, customerId, taskId, usageData) {
+  try {
+    await runQuery(
+      `INSERT INTO worker_usage_stats (
+        worker_id, customer_id, task_id, cpu_usage, memory_usage, 
+        execution_time, timestamp, raw_usage_data
+       ) VALUES (
+        :workerId, :customerId, :taskId, :cpuUsage, :memoryUsage,
+        :executionTime, TO_TIMESTAMP(:timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'), :rawData
+       )`,
+      {
+        workerId,
+        customerId,
+        taskId,
+        cpuUsage: usageData.cpu,
+        memoryUsage: usageData.memory,
+        executionTime: usageData.executionTime,
+        timestamp: usageData.timestamp,
+        rawData: usageData.rawData
+      },
+      { autoCommit: true }
+    );
+    console.log(`📊 Stored usage data for worker ${workerId} on task ${taskId}`);
+  } catch (err) {
+    console.error("Error storing worker usage data:", err);
+  }
+}
+
 // -------------------- CANCEL TASK MANAGEMENT --------------------
 let cancelMap = {}; // { customerId: true/false }
 
@@ -218,7 +292,90 @@ let cancelMap = {}; // { customerId: true/false }
 // Server availability
 app.get("/areyouthere", (req, res) => res.json({ iamthere: true }));
 
-// Login
+// User Registration - UPDATED FOR YOUR SCHEMA
+app.post("/register", async (req, res) => {
+  const { username, password, feild } = req.body;
+
+  // Validate required fields
+  if (!username || !password || !feild) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Username, password, and field are required" 
+    });
+  }
+
+  // Validate field
+  if (!['client', 'resource_provider'].includes(feild)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Field must be either 'client' or 'resource_provider'" 
+    });
+  }
+
+  // Validate length constraints
+  if (username.length > 20) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Username must be 20 characters or less" 
+    });
+  }
+
+  if (password.length > 20) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Password must be 20 characters or less" 
+    });
+  }
+
+  try {
+    // Check if user already exists
+    const checkSql = "SELECT * FROM users WHERE username = TRIM(:username)";
+    const existingUser = await runQuery(checkSql, { username });
+
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Username already exists" 
+      });
+    }
+
+    // Insert new user
+    const insertSql = `
+      INSERT INTO users (username, password, feild) 
+      VALUES (:username, :password, :feild)
+    `;
+    
+    await runQuery(insertSql, {
+      username: username.trim(),
+      password: password.trim(),
+      feild: feild.trim()
+    }, { autoCommit: true });
+
+    // If registering as resource provider, initialize their stats
+    if (feild === 'resource_provider') {
+      await runQuery(
+        `INSERT INTO resource_provider (workerId, taskCompleted, taskPending, taskFailed, taskRunning)
+         VALUES (:workerId, 0, 0, 0, 0)`,
+        { workerId: username.trim() },
+        { autoCommit: true }
+      );
+    }
+
+    console.log(`✅ New ${feild} registered: ${username}`);
+    
+    res.json({ 
+      success: true, 
+      message: "User registered successfully" 
+    });
+  } catch (err) {
+    console.error("Registration error:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error during registration" 
+    });
+  }
+});
+// Login - UPDATED
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -229,7 +386,13 @@ app.post("/login", async (req, res) => {
     console.log(result)
     if (result.rows.length > 0) {
       const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
-      return res.json({ success: true, token, message: "Login successful",togo: result.rows[0][2] });
+      // Note: Changed from 'togo' to 'feild' to match your schema
+      return res.json({ 
+        success: true, 
+        token, 
+        message: "Login successful",
+        togo: result.rows[0][2] // This should be the 'feild' column
+      });
     }
     res.status(401).json({ success: false, message: "Invalid username or password" });
   } catch (err) {
@@ -726,6 +889,10 @@ app.post(
       customerTask.results[workerId] = fileMap.result[0].buffer;
       customerTask.usage[workerId] = fileMap.usage[0].buffer;
 
+      // Parse and store usage data in database
+      const usageData = parseUsageData(fileMap.usage[0].buffer);
+      await storeWorkerUsage(workerId, customerId, customerTask.taskId, usageData);
+
       // Store output files if any
       const outputFiles = {};
       Object.keys(fileMap).forEach(fieldName => {
@@ -806,6 +973,232 @@ app.post(
     }
   }
 );
+
+// -------------------- WORKER USAGE DATA ENDPOINTS --------------------
+
+// Get usage data for a specific worker (for graphs and analytics)
+app.get("/worker/usage/:workerId", async (req, res) => {
+  const { workerId } = req.params;
+  const { days = 30, limit = 100 } = req.query;
+
+  try {
+    const result = await runQuery(
+      `SELECT 
+        usage_id,
+        worker_id,
+        customer_id,
+        task_id,
+        cpu_usage,
+        memory_usage,
+        execution_time,
+        TO_CHAR(timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') as timestamp,
+        raw_usage_data
+       FROM worker_usage_stats 
+       WHERE worker_id = :workerId 
+         AND timestamp >= SYSDATE - :days
+       ORDER BY timestamp DESC
+       FETCH FIRST :limit ROWS ONLY`,
+      { workerId, days: parseInt(days), limit: parseInt(limit) }
+    );
+
+    const usageStats = result.rows.map(row => ({
+      usageId: row[0],
+      workerId: row[1],
+      customerId: row[2],
+      taskId: row[3],
+      cpuUsage: row[4],
+      memoryUsage: row[5],
+      executionTime: row[6],
+      timestamp: row[7],
+      rawUsageData: row[8]
+    }));
+
+    res.json({
+      success: true,
+      workerId,
+      totalRecords: usageStats.length,
+      usageStats,
+      summary: {
+        avgCpu: usageStats.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / usageStats.length || 0,
+        avgMemory: usageStats.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / usageStats.length || 0,
+        avgExecutionTime: usageStats.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / usageStats.length || 0,
+        totalTasks: usageStats.length
+      }
+    });
+  } catch (err) {
+    console.error("Error fetching worker usage data:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching usage data" 
+    });
+  }
+});
+
+// Get usage data for a specific task
+app.get("/task/usage/:taskId", async (req, res) => {
+  const { taskId } = req.params;
+
+  try {
+    const result = await runQuery(
+      `SELECT 
+        worker_id,
+        cpu_usage,
+        memory_usage,
+        execution_time,
+        TO_CHAR(timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') as timestamp
+       FROM worker_usage_stats 
+       WHERE task_id = :taskId 
+       ORDER BY timestamp ASC`,
+      { taskId }
+    );
+
+    const taskUsage = result.rows.map(row => ({
+      workerId: row[0],
+      cpuUsage: row[1],
+      memoryUsage: row[2],
+      executionTime: row[3],
+      timestamp: row[4]
+    }));
+
+    res.json({
+      success: true,
+      taskId,
+      totalWorkers: taskUsage.length,
+      usageStats: taskUsage,
+      averages: {
+        cpu: taskUsage.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / taskUsage.length || 0,
+        memory: taskUsage.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / taskUsage.length || 0,
+        executionTime: taskUsage.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / taskUsage.length || 0
+      }
+    });
+  } catch (err) {
+    console.error("Error fetching task usage data:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching task usage data" 
+    });
+  }
+});
+
+// Download usage data as CSV for a worker
+app.get("/worker/usage/:workerId/download", async (req, res) => {
+  const { workerId } = req.params;
+  const { format = 'csv' } = req.query;
+
+  try {
+    const result = await runQuery(
+      `SELECT 
+        cpu_usage,
+        memory_usage,
+        execution_time,
+        TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp,
+        task_id,
+        customer_id
+       FROM worker_usage_stats 
+       WHERE worker_id = :workerId 
+       ORDER BY timestamp DESC`,
+      { workerId }
+    );
+
+    if (format === 'json') {
+      const usageData = result.rows.map(row => ({
+        timestamp: row[3],
+        taskId: row[4],
+        customerId: row[5],
+        cpuUsage: row[0],
+        memoryUsage: row[1],
+        executionTime: row[2]
+      }));
+
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename=usage_${workerId}.json`);
+      res.json(usageData);
+    } else {
+      // CSV format
+      let csv = 'Timestamp,Task ID,Customer ID,CPU Usage (%),Memory Usage (MB),Execution Time (s)\n';
+      
+      result.rows.forEach(row => {
+        csv += `"${row[3]}","${row[4]}","${row[5]}",${row[0]},${row[1]},${row[2]}\n`;
+      });
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename=usage_${workerId}.csv`);
+      res.send(csv);
+    }
+  } catch (err) {
+    console.error("Error downloading usage data:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error downloading usage data" 
+    });
+  }
+});
+
+// Get worker performance summary
+app.get("/worker/performance/:workerId", async (req, res) => {
+  const { workerId } = req.params;
+
+  try {
+    const result = await runQuery(
+      `SELECT 
+        COUNT(*) as total_tasks,
+        AVG(cpu_usage) as avg_cpu,
+        AVG(memory_usage) as avg_memory,
+        AVG(execution_time) as avg_execution_time,
+        MAX(cpu_usage) as max_cpu,
+        MAX(memory_usage) as max_memory,
+        MAX(execution_time) as max_execution_time,
+        MIN(timestamp) as first_task,
+        MAX(timestamp) as last_task
+       FROM worker_usage_stats 
+       WHERE worker_id = :workerId`,
+      { workerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "No usage data found for this worker" 
+      });
+    }
+
+    const stats = result.rows[0];
+    const performance = {
+      workerId,
+      totalTasks: stats[0],
+      averages: {
+        cpu: Math.round(stats[1] * 100) / 100,
+        memory: Math.round(stats[2] * 100) / 100,
+        executionTime: Math.round(stats[3] * 100) / 100
+      },
+      maximums: {
+        cpu: stats[4],
+        memory: stats[5],
+        executionTime: stats[6]
+      },
+      timeline: {
+        firstTask: stats[7],
+        lastTask: stats[8]
+      },
+      efficiency: {
+        cpuEfficiency: Math.round((stats[1] / 100) * 10000) / 100, // Percentage of optimal CPU usage
+        memoryEfficiency: Math.round((stats[2] / 4096) * 10000) / 100, // Assuming 4GB max memory
+        speedEfficiency: stats[3] > 0 ? Math.round((300 / stats[3]) * 100) / 100 : 0 // Compared to 5min baseline
+      }
+    };
+
+    res.json({
+      success: true,
+      performance
+    });
+  } catch (err) {
+    console.error("Error fetching worker performance:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching performance data" 
+    });
+  }
+});
 
 // Heartbeat endpoint
 app.post("/heartbeat", (req, res) => {
@@ -975,6 +1368,7 @@ app.listen(PORT, () => {
   console.log(`🗄️  Database: ${dbConfig.connectString}`);
   console.log(`🎯 Completion notifications: ACTIVE`);
   console.log(`📦 Output files support: ENABLED`);
+  console.log(`📈 Worker usage analytics: ENABLED`);
 });
 
 export default app;
