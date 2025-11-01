@@ -41,11 +41,30 @@ async function runQuery(sql, binds = {}, options = {}) {
   let conn;
   try {
     conn = await oracledb.getConnection(dbConfig);
-    const result = await conn.execute(sql, binds, { ...options, outFormat: oracledb.OUT_FORMAT_OBJECT });
-    await conn.commit();
-    return result;
+    
+    // For SELECT queries with BLOBs, we need special handling
+    if (sql.trim().toUpperCase().startsWith('SELECT') && 
+        (sql.includes('code') || sql.includes('dataset') || sql.includes('requirement'))) {
+      
+      // Use outFormat OBJECT and specify fetchInfo for BLOB columns
+      const result = await conn.execute(sql, binds, { 
+        ...options, 
+        outFormat: oracledb.OUT_FORMAT_OBJECT,
+        fetchInfo: {
+          "CODE": { type: oracledb.BUFFER },
+          "DATASET": { type: oracledb.BUFFER },
+          "REQUIREMENT": { type: oracledb.BUFFER }
+        }
+      });
+      await conn.commit();
+      return result;
+    } else {
+      const result = await conn.execute(sql, binds, { ...options, outFormat: oracledb.OUT_FORMAT_OBJECT });
+      await conn.commit();
+      return result;
+    }
   } catch (err) {
-    console.error("Oracle DB Error:", err);
+    console.error("Oracle DB Error:", err.message);
     throw err;
   } finally {
     if (conn) await conn.close();
@@ -82,6 +101,45 @@ function extractSafeData(rows) {
   });
 }
 
+// Helper function to safely extract BLOB data
+async function extractBlobData(blobData) {
+  if (blobData instanceof Buffer) {
+    return blobData;
+  }
+  
+  if (typeof blobData === 'object' && blobData !== null) {
+    try {
+      // Try different methods to extract BLOB data
+      if (typeof blobData.read === 'function') {
+        return await new Promise((resolve, reject) => {
+          const chunks = [];
+          blobData.on('data', (chunk) => chunks.push(chunk));
+          blobData.on('end', () => resolve(Buffer.concat(chunks)));
+          blobData.on('error', reject);
+          blobData.read();
+        });
+      }
+      
+      if (typeof blobData.getData === 'function') {
+        return blobData.getData();
+      }
+      
+      if (blobData._buffer) {
+        return blobData._buffer;
+      }
+      
+      // Last resort - convert to string
+      return Buffer.from(String(blobData));
+      
+    } catch (error) {
+      console.error("Error extracting BLOB data:", error.message);
+      throw new Error(`BLOB extraction failed: ${error.message}`);
+    }
+  }
+  
+  return Buffer.from(String(blobData));
+}
+
 // -------------------- WORKER VALIDATION --------------------
 async function validateWorker(workerId) {
   try {
@@ -89,7 +147,7 @@ async function validateWorker(workerId) {
     const result = await runQuery(sql, { workerId });
     return result.rows.length > 0;
   } catch (err) {
-    console.error("Error validating worker:", err);
+    console.error("Error validating worker:", err.message);
     return false;
   }
 }
@@ -186,7 +244,7 @@ function parseUsageData(usageBuffer) {
 
     return usageData;
   } catch (error) {
-    console.error("Error parsing usage data:", error);
+    console.error("Error parsing usage data:", error.message);
     return {
       cpu: 0,
       memory: 0,
@@ -309,7 +367,7 @@ async function initWorkerStats(workerId) {
       { workerId }
     );
   } catch (err) {
-    console.error("Error initializing worker stats:", err);
+    console.error("Error initializing worker stats:", err.message);
   }
 }
 
@@ -322,7 +380,7 @@ async function incrementWorkerStat(workerId, stat, value = 1) {
       { workerId, value }
     );
   } catch (err) {
-    console.error("Error updating worker stats:", err);
+    console.error("Error updating worker stats:", err.message);
   }
 }
 
@@ -351,7 +409,7 @@ async function storeWorkerUsage(workerId, customerId, taskId, usageData) {
     );
     console.log(`📊 Stored usage data for worker ${workerId} on task ${taskId}`);
   } catch (err) {
-    console.error("Error storing worker usage data:", err);
+    console.error("Error storing worker usage data:", err.message);
   }
 }
 
@@ -439,7 +497,7 @@ app.post("/register", async (req, res) => {
       message: "User registered successfully" 
     });
   } catch (err) {
-    console.error("Registration error:", err);
+    console.error("Registration error:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Server error during registration" 
@@ -467,7 +525,7 @@ app.post("/login", async (req, res) => {
     }
     res.status(401).json({ success: false, message: "Invalid username or password" });
   } catch (err) {
-    console.error(err);
+    console.error(err.message);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
@@ -594,107 +652,186 @@ app.post(
         taskId 
       });
     } catch (error) {
-      console.error("Error in /sendingpackage:", error);
+      console.error("Error in /sendingpackage:", error.message);
       res.status(500).json({ message: "Internal server error" });
     }
   }
 );
 
-// -------------------- NEW ENDPOINTS FOR GETTING STORED FILES --------------------
+// -------------------- FILE DOWNLOAD ENDPOINTS (FIXED) --------------------
 
-// Get stored code file
+// Get stored code file - FIXED CIRCULAR REFERENCE ISSUE
 app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
   try {
+    console.log(`🔍 Fetching code file for customer: ${customerId}`);
+    
     const result = await runQuery(
-      `SELECT code FROM files WHERE customer_id = :customerId`,
+      `SELECT code, customername FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: "File not found" });
+      console.log(`❌ Customer ${customerId} not found in database`);
+      return res.status(404).json({ 
+        success: false,
+        message: "Customer not found" 
+      });
     }
 
-    const codeBuffer = result.rows[0].CODE;
-    if (!codeBuffer) {
-      return res.status(404).json({ message: "Code file not found" });
+    const codeData = result.rows[0].CODE;
+    const customerName = result.rows[0].CUSTOMERNAME;
+
+    if (!codeData) {
+      console.log(`❌ Code file is null for customer ${customerId}`);
+      return res.status(404).json({ 
+        success: false,
+        message: "Code file not found or is empty" 
+      });
     }
+
+    // Use the safe blob extraction function
+    const codeBuffer = await extractBlobData(codeData);
+    
+    if (!codeBuffer || codeBuffer.length === 0) {
+      console.log(`❌ Code buffer is empty for customer ${customerId}`);
+      return res.status(404).json({ 
+        success: false,
+        message: "Code file is empty" 
+      });
+    }
+
+    console.log(`✅ Sending code file for customer ${customerId}, size: ${codeBuffer.length} bytes`);
 
     // Set appropriate headers for download
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="code_${customerId}.py"`);
     res.setHeader('Content-Length', codeBuffer.length);
+    res.setHeader('Cache-Control', 'no-cache');
     
     res.send(codeBuffer);
-    console.log(`📄 Sent code file for customer ${customerId}`);
-  } catch (err) {
-    console.error("Error fetching code file:", err);
-    res.status(500).json({ message: "Error fetching code file" });
-  }
-});
-
-// Get stored requirement file
-app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
-  const { customerId } = req.params;
-  
-  try {
-    const result = await runQuery(
-      `SELECT requirement FROM files WHERE customer_id = :customerId`,
-      { customerId }
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "File not found" });
-    }
-
-    const requirementBuffer = result.rows[0].REQUIREMENT;
-    if (!requirementBuffer) {
-      return res.status(404).json({ message: "Requirement file not found" });
-    }
-
-    // Set appropriate headers for download
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="requirements_${customerId}.txt"`);
-    res.setHeader('Content-Length', requirementBuffer.length);
     
-    res.send(requirementBuffer);
-    console.log(`📄 Sent requirement file for customer ${customerId}`);
   } catch (err) {
-    console.error("Error fetching requirement file:", err);
-    res.status(500).json({ message: "Error fetching requirement file" });
+    console.error("❌ Error fetching code file:", err.message);
+    res.status(500).json({ 
+      success: false,
+      message: "Error fetching code file: " + err.message
+    });
   }
 });
 
-// Get stored dataset file
+// Get stored dataset file - FIXED
 app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
   try {
+    console.log(`🔍 Fetching dataset file for customer: ${customerId}`);
+    
     const result = await runQuery(
-      `SELECT dataset FROM files WHERE customer_id = :customerId`,
+      `SELECT dataset, customername FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: "File not found" });
+      return res.status(404).json({ 
+        success: false,
+        message: "Customer not found" 
+      });
     }
 
-    const datasetBuffer = result.rows[0].DATASET;
-    if (!datasetBuffer) {
-      return res.status(404).json({ message: "Dataset file not found" });
+    const datasetData = result.rows[0].DATASET;
+    const customerName = result.rows[0].CUSTOMERNAME;
+
+    if (!datasetData) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Dataset file not found" 
+      });
     }
 
-    // Set appropriate headers for download
+    // Use the safe blob extraction function
+    const datasetBuffer = await extractBlobData(datasetData);
+    
+    if (!datasetBuffer || datasetBuffer.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Dataset file is empty" 
+      });
+    }
+
+    console.log(`✅ Sending dataset file for customer ${customerId}, size: ${datasetBuffer.length} bytes`);
+
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="dataset_${customerId}"`);
     res.setHeader('Content-Length', datasetBuffer.length);
+    res.setHeader('Cache-Control', 'no-cache');
     
     res.send(datasetBuffer);
-    console.log(`📄 Sent dataset file for customer ${customerId}`);
+    
   } catch (err) {
-    console.error("Error fetching dataset file:", err);
-    res.status(500).json({ message: "Error fetching dataset file" });
+    console.error("Error fetching dataset file:", err.message);
+    res.status(500).json({ 
+      success: false,
+      message: "Error fetching dataset file: " + err.message
+    });
+  }
+});
+
+// Get stored requirement file - FIXED
+app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    console.log(`🔍 Fetching requirement file for customer: ${customerId}`);
+    
+    const result = await runQuery(
+      `SELECT requirement, customername FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Customer not found" 
+      });
+    }
+
+    const requirementData = result.rows[0].REQUIREMENT;
+    const customerName = result.rows[0].CUSTOMERNAME;
+
+    if (!requirementData) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Requirement file not found" 
+      });
+    }
+
+    // Use the safe blob extraction function
+    const requirementBuffer = await extractBlobData(requirementData);
+    
+    if (!requirementBuffer || requirementBuffer.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Requirement file is empty" 
+      });
+    }
+
+    console.log(`✅ Sending requirement file for customer ${customerId}, size: ${requirementBuffer.length} bytes`);
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="requirements_${customerId}.txt"`);
+    res.setHeader('Content-Length', requirementBuffer.length);
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    res.send(requirementBuffer);
+    
+  } catch (err) {
+    console.error("Error fetching requirement file:", err.message);
+    res.status(500).json({ 
+      success: false,
+      message: "Error fetching requirement file: " + err.message
+    });
   }
 });
 
@@ -743,7 +880,7 @@ app.get("/files/info/:customerId", authenticateJWT, async (req, res) => {
 
     res.json(response);
   } catch (err) {
-    console.error("Error fetching file info:", err);
+    console.error("Error fetching file info:", err.message);
     res.status(500).json({ message: "Error fetching file information" });
   }
 });
@@ -771,17 +908,20 @@ app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
 
     // Add code file
     if (files.CODE) {
-      archive.append(files.CODE, { name: `code.py` });
+      const codeBuffer = await extractBlobData(files.CODE);
+      archive.append(codeBuffer, { name: `code.py` });
     }
 
     // Add dataset file
     if (files.DATASET) {
-      archive.append(files.DATASET, { name: `dataset` });
+      const datasetBuffer = await extractBlobData(files.DATASET);
+      archive.append(datasetBuffer, { name: `dataset` });
     }
 
     // Add requirement file
     if (files.REQUIREMENT) {
-      archive.append(files.REQUIREMENT, { name: `requirements.txt` });
+      const requirementBuffer = await extractBlobData(files.REQUIREMENT);
+      archive.append(requirementBuffer, { name: `requirements.txt` });
     }
 
     // Add info file
@@ -798,7 +938,7 @@ app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
     archive.append(JSON.stringify(info, null, 2), { name: `file_info.json` });
 
     archive.on('error', (err) => {
-      console.error('Archive error:', err);
+      console.error('Archive error:', err.message);
       res.status(500).json({ message: "Error creating ZIP file" });
     });
 
@@ -806,7 +946,7 @@ app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
     console.log(`📦 Sent all files as ZIP for customer ${customerId}`);
     
   } catch (err) {
-    console.error("Error creating files ZIP:", err);
+    console.error("Error creating files ZIP:", err.message);
     res.status(500).json({ message: "Error creating files package" });
   }
 });
@@ -924,7 +1064,7 @@ NOTE: Each worker processed a portion of the dataset and produced independent re
     archive.append(JSON.stringify(metadata, null, 2), { name: `metadata.json` });
 
     archive.on('error', (err) => {
-      console.error('Archive error:', err);
+      console.error('Archive error:', err.message);
       res.status(500).json({ message: "Error creating ZIP file" });
     });
 
@@ -939,7 +1079,7 @@ NOTE: Each worker processed a portion of the dataset and produced independent re
     console.log(`📦 Included ${totalOutputFiles} output files in the ZIP`);
     
   } catch (error) {
-    console.error("Error creating ZIP:", error);
+    console.error("Error creating ZIP:", error.message);
     res.status(500).json({ message: "Error creating results package" });
   }
 });
@@ -1139,7 +1279,7 @@ app.post("/gettask", async (req, res) => {
 const uploadResultHandler = (req, res, next) => {
   upload.any()(req, res, (err) => {
     if (err) {
-      console.error("Upload error:", err);
+      console.error("Upload error:", err.message);
       return res.status(400).json({ resp: false, message: `Upload error: ${err.message}` });
     }
     next();
@@ -1282,7 +1422,7 @@ app.post(
         message: `Result uploaded successfully. ${submittedResults}/${totalWorkers} workers completed.`
       });
     } catch (err) {
-      console.error("❌ /uploadresult error:", err);
+      console.error("❌ /uploadresult error:", err.message);
       res.status(500).json({ 
         resp: false, 
         message: "Internal server error during result upload",
@@ -1360,11 +1500,11 @@ app.get("/worker/usage/:workerId", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Error fetching worker usage data:", err);
+    console.error("Error fetching worker usage data:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error fetching usage data",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -1410,11 +1550,11 @@ app.get("/task/usage/:taskId", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Error fetching task usage data:", err);
+    console.error("Error fetching task usage data:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error fetching task usage data",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -1477,11 +1617,11 @@ app.get("/worker/usage/:workerId/download", async (req, res) => {
       res.send(csv);
     }
   } catch (err) {
-    console.error("Error downloading usage data:", err);
+    console.error("Error downloading usage data:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error downloading usage data",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -1556,11 +1696,11 @@ app.get("/worker/performance/:workerId", async (req, res) => {
       performance
     });
   } catch (err) {
-    console.error("Error fetching worker performance:", err);
+    console.error("Error fetching worker performance:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error fetching performance data",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -1634,11 +1774,11 @@ app.get("/clients/summary", authenticateJWT, async (req, res) => {
       clients
     });
   } catch (err) {
-    console.error("Error fetching clients summary:", err);
+    console.error("Error fetching clients summary:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error fetching clients summary",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -1801,14 +1941,75 @@ app.get("/client/documents/:customerId", authenticateJWT, async (req, res) => {
 
     res.json(response);
   } catch (err) {
-    console.error("Error fetching client documents:", err);
+    console.error("Error fetching client documents:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error fetching client documents",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
+
+// Helper function to detect file extension from buffer
+async function getFileExtension(buffer) {
+  try {
+    // Simple detection based on file signatures
+    const signatures = {
+      'ffd8ffe0': '.jpg',
+      '89504e47': '.png',
+      '47494638': '.gif',
+      '25504446': '.pdf',
+      '504b0304': '.zip',
+      '504b0506': '.zip',
+      '504b0708': '.zip',
+      '377abcaf': '.7z',
+      '1f8b08': '.gz',
+      '424d': '.bmp',
+      '494433': '.mp3',
+      '000001ba': '.mpg',
+      '000001b3': '.mpg',
+      '3026b275': '.wmv',
+      '52494646': '.avi',
+      '4f676753': '.ogg',
+      '664c6143': '.flac',
+      '4d546864': '.mid',
+      'd0cf11e0': '.msi', // Also .doc, .xls, .ppt
+      '504b34': '.jar',
+      '7b5c7274': '.rtf',
+      '25215053': '.eps',
+      '25504446': '.pdf',
+      '2525454f': '.pdf',
+      '255044462d': '.pdf'
+    };
+
+    const hex = buffer.slice(0, 8).toString('hex').toLowerCase();
+    
+    for (const [signature, extension] of Object.entries(signatures)) {
+      if (hex.startsWith(signature.toLowerCase())) {
+        return extension;
+      }
+    }
+    
+    // Check for text files
+    const text = buffer.slice(0, 1000).toString();
+    if (text.includes('<?xml') || text.includes('<html')) return '.html';
+    if (text.includes('{') && text.includes('}')) return '.json';
+    if (text.includes(',') && text.split('\n')[0].split(',').length > 1) return '.csv';
+    
+    return ''; // Unknown extension
+  } catch (err) {
+    return '';
+  }
+}
+
+// Helper function to format file size
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
 
 // Enhanced download all documents endpoint
 app.get("/client/documents/:customerId/download/all", authenticateJWT, async (req, res) => {
@@ -1834,15 +2035,18 @@ app.get("/client/documents/:customerId/download/all", authenticateJWT, async (re
 
     // Add input files with proper extensions
     if (files.CODE) {
-      archive.append(files.CODE, { name: `input_files/code.py` });
+      const codeBuffer = await extractBlobData(files.CODE);
+      archive.append(codeBuffer, { name: `input_files/code.py` });
     }
     if (files.DATASET) {
+      const datasetBuffer = await extractBlobData(files.DATASET);
       // Try to determine dataset file extension
-      const datasetExtension = await getFileExtension(files.DATASET);
-      archive.append(files.DATASET, { name: `input_files/dataset${datasetExtension}` });
+      const datasetExtension = await getFileExtension(datasetBuffer);
+      archive.append(datasetBuffer, { name: `input_files/dataset${datasetExtension}` });
     }
     if (files.REQUIREMENT) {
-      archive.append(files.REQUIREMENT, { name: `input_files/requirements.txt` });
+      const requirementBuffer = await extractBlobData(files.REQUIREMENT);
+      archive.append(requirementBuffer, { name: `input_files/requirements.txt` });
     }
 
     // Get enhanced usage data
@@ -1950,6 +2154,10 @@ app.get("/client/documents/:customerId/download/all", authenticateJWT, async (re
     }
 
     // Add file manifest
+    const codeSize = files.CODE ? (await extractBlobData(files.CODE)).length : 0;
+    const datasetSize = files.DATASET ? (await extractBlobData(files.DATASET)).length : 0;
+    const requirementSize = files.REQUIREMENT ? (await extractBlobData(files.REQUIREMENT)).length : 0;
+    
     const manifest = {
       customerId,
       customerName,
@@ -1965,9 +2173,9 @@ app.get("/client/documents/:customerId/download/all", authenticateJWT, async (re
         'README.txt'
       ].filter(Boolean).length,
       fileSizes: {
-        code: files.CODE ? files.CODE.length : 0,
-        dataset: files.DATASET ? files.DATASET.length : 0,
-        requirement: files.REQUIREMENT ? files.REQUIREMENT.length : 0
+        code: codeSize,
+        dataset: datasetSize,
+        requirement: requirementSize
       }
     };
     archive.append(JSON.stringify(manifest, null, 2), { name: `manifest.json` });
@@ -2025,7 +2233,7 @@ Total Size: ${formatFileSize(Object.values(manifest.fileSizes).reduce((a, b) => 
     archive.append(readme, { name: `README.txt` });
 
     archive.on('error', (err) => {
-      console.error('Archive error:', err);
+      console.error('Archive error:', err.message);
       res.status(500).json({ message: "Error creating documents archive" });
     });
 
@@ -2036,71 +2244,10 @@ Total Size: ${formatFileSize(Object.values(manifest.fileSizes).reduce((a, b) => 
     archive.finalize();
     
   } catch (err) {
-    console.error("Error creating enhanced documents archive:", err);
+    console.error("Error creating enhanced documents archive:", err.message);
     res.status(500).json({ message: "Error creating documents package" });
   }
 });
-
-// Helper function to detect file extension from buffer
-async function getFileExtension(buffer) {
-  try {
-    // Simple detection based on file signatures
-    const signatures = {
-      'ffd8ffe0': '.jpg',
-      '89504e47': '.png',
-      '47494638': '.gif',
-      '25504446': '.pdf',
-      '504b0304': '.zip',
-      '504b0506': '.zip',
-      '504b0708': '.zip',
-      '377abcaf': '.7z',
-      '1f8b08': '.gz',
-      '424d': '.bmp',
-      '494433': '.mp3',
-      '000001ba': '.mpg',
-      '000001b3': '.mpg',
-      '3026b275': '.wmv',
-      '52494646': '.avi',
-      '4f676753': '.ogg',
-      '664c6143': '.flac',
-      '4d546864': '.mid',
-      'd0cf11e0': '.msi', // Also .doc, .xls, .ppt
-      '504b34': '.jar',
-      '7b5c7274': '.rtf',
-      '25215053': '.eps',
-      '25504446': '.pdf',
-      '2525454f': '.pdf',
-      '255044462d': '.pdf'
-    };
-
-    const hex = buffer.slice(0, 8).toString('hex').toLowerCase();
-    
-    for (const [signature, extension] of Object.entries(signatures)) {
-      if (hex.startsWith(signature.toLowerCase())) {
-        return extension;
-      }
-    }
-    
-    // Check for text files
-    const text = buffer.slice(0, 1000).toString();
-    if (text.includes('<?xml') || text.includes('<html')) return '.html';
-    if (text.includes('{') && text.includes('}')) return '.json';
-    if (text.includes(',') && text.split('\n')[0].split(',').length > 1) return '.csv';
-    
-    return ''; // Unknown extension
-  } catch (err) {
-    return '';
-  }
-}
-
-// Helper function to format file size
-function formatFileSize(bytes) {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
 
 // Delete client documents (optional cleanup endpoint)
 app.delete("/client/documents/:customerId", authenticateJWT, async (req, res) => {
@@ -2139,11 +2286,11 @@ app.delete("/client/documents/:customerId", authenticateJWT, async (req, res) =>
       message: "Client documents deleted successfully"
     });
   } catch (err) {
-    console.error("Error deleting client documents:", err);
+    console.error("Error deleting client documents:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error deleting client documents",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -2196,11 +2343,11 @@ app.get("/clients/search", authenticateJWT, async (req, res) => {
       clients
     });
   } catch (err) {
-    console.error("Error searching clients:", err);
+    console.error("Error searching clients:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error searching clients",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -2241,11 +2388,11 @@ app.get("/admin/clients", authenticateJWT, async (req, res) => {
       clients
     });
   } catch (err) {
-    console.error("Error fetching clients list:", err);
+    console.error("Error fetching clients list:", err.message);
     res.status(500).json({ 
       success: false, 
       message: "Error fetching clients list",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -2272,13 +2419,16 @@ app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async 
     archive.pipe(res);
 
     if (files.CODE) {
-      archive.append(files.CODE, { name: `code.py` });
+      const codeBuffer = await extractBlobData(files.CODE);
+      archive.append(codeBuffer, { name: `code.py` });
     }
     if (files.DATASET) {
-      archive.append(files.DATASET, { name: `dataset` });
+      const datasetBuffer = await extractBlobData(files.DATASET);
+      archive.append(datasetBuffer, { name: `dataset` });
     }
     if (files.REQUIREMENT) {
-      archive.append(files.REQUIREMENT, { name: `requirements.txt` });
+      const requirementBuffer = await extractBlobData(files.REQUIREMENT);
+      archive.append(requirementBuffer, { name: `requirements.txt` });
     }
 
     // Add file info
@@ -2287,15 +2437,15 @@ app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async 
       customerName,
       exportedAt: new Date().toISOString(),
       files: {
-        code: files.CODE ? `code.py (${files.CODE.length} bytes)` : 'Not available',
-        dataset: files.DATASET ? `dataset (${files.DATASET.length} bytes)` : 'Not available',
-        requirement: files.REQUIREMENT ? `requirements.txt (${files.REQUIREMENT.length} bytes)` : 'Not available'
+        code: files.CODE ? `code.py (${(await extractBlobData(files.CODE)).length} bytes)` : 'Not available',
+        dataset: files.DATASET ? `dataset (${(await extractBlobData(files.DATASET)).length} bytes)` : 'Not available',
+        requirement: files.REQUIREMENT ? `requirements.txt (${(await extractBlobData(files.REQUIREMENT)).length} bytes)` : 'Not available'
       }
     };
     archive.append(JSON.stringify(fileInfo, null, 2), { name: `file_info.json` });
 
     archive.on('error', (err) => {
-      console.error('Archive error:', err);
+      console.error('Archive error:', err.message);
       res.status(500).json({ message: "Error creating input files archive" });
     });
 
@@ -2303,7 +2453,7 @@ app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async 
     console.log(`📦 Sent input files archive for client ${customerId}`);
     
   } catch (err) {
-    console.error("Error creating input files archive:", err);
+    console.error("Error creating input files archive:", err.message);
     res.status(500).json({ message: "Error creating input files package" });
   }
 });
@@ -2365,7 +2515,7 @@ app.get("/client/documents/:customerId/download/usage", authenticateJWT, async (
     console.log(`📊 Sent usage report for client ${customerId}`);
     
   } catch (err) {
-    console.error("Error creating usage report:", err);
+    console.error("Error creating usage report:", err.message);
     res.status(500).json({ message: "Error creating usage report" });
   }
 });
@@ -2457,10 +2607,10 @@ app.get("/workerstats/:workerId", async (req, res) => {
       TASKRUNNING: stats.TASKRUNNING
     });
   } catch (err) {
-    console.error("Error fetching worker stats:", err);
+    console.error("Error fetching worker stats:", err.message);
     res.status(500).json({ 
       message: "Server error fetching worker stats",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
@@ -2496,10 +2646,10 @@ app.post("/workerstats", async (req, res) => {
       TASKRUNNING: stats.TASKRUNNING
     });
   } catch (err) {
-    console.error("Error in /workerstats:", err);
+    console.error("Error in /workerstats:", err.message);
     res.status(500).json({ 
       message: "Server error",
-      error: err.toString() 
+      error: err.message 
     });
   }
 });
