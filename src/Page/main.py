@@ -19,7 +19,7 @@ import socket
 #                  CONFIGURATION
 # =====================================================
 SERVER_URL = "http://localhost:5000"
-worker_id = os.environ.get("WORKER_ID", "Kumar")
+worker_id = os.environ.get("WORKER_ID", "")
 HEARTBEAT_INTERVAL = 5  # seconds
 
 # Filename used if no env key provided
@@ -33,6 +33,7 @@ shutdown_flag = threading.Event()
 active_container = None           # docker.Container object while running
 current_folder = None             # folder for current task
 current_customer_id = None
+current_task_id = None
 current_usage_log = []            # list of usage dicts collected during run
 heartbeat_stop = None             # threading.Event returned by start_heartbeat()
 docker_client = None              # cached docker client (docker.from_env())
@@ -93,15 +94,48 @@ def jsonl_to_txt(jsonl_path: str, txt_path: str):
     except FileNotFoundError:
         pass
 
-def upload_result(customer_id_param: str, worker_id_param: str, result_bytes: bytes, usage_bytes: bytes):
+def collect_output_files(folder_path):
+    """Collect all output files created by the user's code."""
+    output_files = {}
+    
+    # Common output file extensions to look for
+    output_extensions = {'.csv', '.txt', '.json', '.xlsx', '.xls', '.png', '.jpg', '.jpeg', '.pdf'}
+    
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            # Skip system files and our own log files
+            if (file.startswith('.') or 
+                file in ['usage_log.jsonl', 'usage_log.txt', 'result_output.txt', 'pip_install.log'] or
+                file == LOCAL_KEYFILE):
+                continue
+                
+            # Check if it's likely an output file (not input file)
+            if (file.endswith(tuple(output_extensions)) and 
+                not file.startswith(('code_file', 'dataset_file', 'requirements'))):
+                try:
+                    with open(file_path, 'rb') as f:
+                        output_files[file] = f.read()
+                    log(f"📁 Collected output file: {file}")
+                except Exception as e:
+                    log(f"⚠️ Failed to read output file {file}: {e}")
+    
+    return output_files
+
+def upload_result(customer_id_param: str, worker_id_param: str, result_bytes: bytes, usage_bytes: bytes, output_files: dict = None):
     """
-    Upload result and usage logs to server using multipart/form-data files.
-    Keeps same behaviour as original script.
+    Upload result, usage logs, and output files to server using multipart/form-data.
     """
     files = {
         "result": ("result_output.txt", result_bytes),
         "usage": ("usage_log.txt", usage_bytes)
     }
+    
+    # Add output files to the upload
+    if output_files:
+        for filename, file_content in output_files.items():
+            files[f"output_{filename}"] = (filename, file_content)
+    
     payload = {"workerId": worker_id_param, "customerId": customer_id_param}
     try:
         r = requests.post(f"{SERVER_URL}/uploadresult", files=files, data=payload, timeout=30)
@@ -109,6 +143,11 @@ def upload_result(customer_id_param: str, worker_id_param: str, result_bytes: by
         response = r.json()
         if response.get("resp"):
             log(f"✅ Result uploaded successfully. Pending workers: {response.get('pendingWorkers')}")
+            log(f"📊 Progress: {response.get('progress', {}).get('submitted', 0)}/{response.get('progress', {}).get('total', 0)} workers completed")
+            
+            # Log output files that were uploaded
+            if output_files:
+                log(f"📦 Uploaded {len(output_files)} output files: {', '.join(output_files.keys())}")
         else:
             log(f"❌ Upload failed: {response.get('message')}")
     except requests.exceptions.RequestException as e:
@@ -232,31 +271,12 @@ def monitor_container_usage(container, customer_id_local, worker_id_local, usage
 
 def is_docker_running():
     """Return True if Docker daemon/socket is reachable."""
-    # Windows: named pipe //./pipe/docker_engine
-    if sys.platform.startswith("win"):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # try docker API via local TCP (if Docker configured), fallback to attempting docker.from_env()
-            # Simpler: try docker.from_env ping
-            try:
-                client = docker.from_env()
-                client.ping()
-                return True
-            except Exception:
-                return False
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-    else:
-        # Unix: try docker socket or ping
-        try:
-            client = docker.from_env()
-            client.ping()
-            return True
-        except Exception:
-            return False
+    try:
+        client = docker.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
 
 def ensure_docker_running():
     """Ensure Docker daemon is running and set global docker_client."""
@@ -298,7 +318,7 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
     current_customer_id = customer_id_local
     current_usage_log = []
 
-    send_update("Docker initialized")
+    send_update(f"🔧 Worker {worker_id_local} started processing")
 
     abs_folder = os.path.abspath(folder_path)
 
@@ -314,7 +334,7 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
 
     if os.path.exists(req_path) and os.path.getsize(req_path) > 0:
         commands.append(f"pip install --no-cache-dir -r /app/{requirements_file} > {pip_log} 2>&1")
-        send_update("Installing dependencies...")
+        send_update("📦 Installing dependencies...")
 
     commands.append(f"python /app/{code_file}")
     final_cmd = " && ".join(commands)
@@ -333,7 +353,8 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
         raise RuntimeError(f"Failed to start container: {e}")
 
     active_container = container  # track container for safe shutdown
-    send_update("Container started")
+    send_update("🐳 Container started - processing data...")
+    
     # start cancel monitor
     start_cancel_monitor(customer_id_local)
 
@@ -374,6 +395,9 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
     exit_code = result.get("StatusCode", -1)
     logs_output = "\n".join(logs)
 
+    # Collect output files BEFORE container cleanup
+    output_files = collect_output_files(abs_folder)
+
     # cleanup container object
     try:
         container.remove(force=True)
@@ -392,9 +416,9 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
     with open(result_file, "w", encoding="utf-8") as f:
         f.write(logs_output)
 
-    # upload result and usage (multipart)
+    # upload result, usage, and output files
     try:
-        upload_result(customer_id_local, worker_id_local, logs_output.encode(), json.dumps(current_usage_log).encode())
+        upload_result(customer_id_local, worker_id_local, logs_output.encode(), json.dumps(current_usage_log).encode(), output_files)
     except Exception as e:
         log(f"❌ Upload attempt failed: {e}")
 
@@ -403,8 +427,8 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
         max_mem = max(e.get("mem_usage_MB", 0) for e in current_usage_log)
         log(f"\n📊 CPU avg: {avg_cpu:.2f}% | Peak RAM: {max_mem:.2f} MB\n")
 
-    send_update(f"Docker finished with exit code {exit_code}")
-    return {"exit_code": exit_code, "output": logs_output}
+    send_update(f"✅ Worker {worker_id_local} completed processing with exit code {exit_code}")
+    return {"exit_code": exit_code, "output": logs_output, "output_files": output_files}
 
 # =====================================================
 #                 HEARTBEAT SYSTEM
@@ -412,7 +436,7 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
 
 def send_heartbeat():
     """Single heartbeat POST (used by thread)."""
-    payload = {"workerId": worker_id}
+    payload = {"workerId": worker_id, "customerId": current_customer_id or "idle"}
     try:
         requests.post(f"{SERVER_URL}/heartbeat", json=payload, timeout=5)
     except Exception as e:
@@ -423,7 +447,8 @@ def start_heartbeat(interval=HEARTBEAT_INTERVAL):
     def loop():
         while not stop_evt.is_set() and not shutdown_flag.is_set():
             try:
-                requests.post(f"{SERVER_URL}/heartbeat", json={"workerId": worker_id}, timeout=5)
+                payload = {"workerId": worker_id, "customerId": current_customer_id or "idle"}
+                requests.post(f"{SERVER_URL}/heartbeat", json=payload, timeout=5)
             except Exception as e:
                 log(f"⚠️ Heartbeat failed: {e}")
             sleep(interval)
@@ -447,16 +472,23 @@ def claim_task():
         r = requests.post(f"{SERVER_URL}/gettask", json={"workerId": worker_id}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        if not data.get("taskId") and not data.get("task_id"):
-            return None, None, None
-        # support both naming conventions
-        task_id = data.get("taskId") or data.get("task_id")
-        customer = data.get("customerId") or data.get("customer_id") or ""
-        files = data.get("files") or data.get("file_payload") or {}
-        return customer, task_id, files
+        
+        if not data.get("taskAvailable", False):
+            return None, None, None, None
+            
+        # Get task details with new server response format
+        task_id = data.get("taskId")
+        customer_id = data.get("customerId")
+        files = data.get("files", {})
+        assignment = data.get("assignment", {})
+        
+        log(f"📥 Received task: customer={customer_id}, task={task_id}, worker_index={assignment.get('workerIndex')}/{assignment.get('totalWorkers')}")
+        
+        return customer_id, task_id, files, assignment
+        
     except requests.exceptions.RequestException as e:
         log(f"⚠️ Claim task error: {e}")
-        return None, None, None
+        return None, None, None, None
 
 def save_files(customer_id_local, files):
     """Save base64-encoded files to local folder named after customer_id_local."""
@@ -464,18 +496,29 @@ def save_files(customer_id_local, files):
     os.makedirs(folder, exist_ok=True)
 
     def decode_and_save(b64data, filename):
+        if not b64data:
+            return None
         path = os.path.join(folder, filename)
         with open(path, "wb") as f:
             f.write(base64.b64decode(b64data))
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         return path
 
+    # Save code file (required)
     if files.get("code"):
         decode_and_save(files["code"], "code_file.py")
+    else:
+        raise ValueError("No code file provided in task")
+
+    # Save dataset file (optional)
     if files.get("dataset"):
         decode_and_save(files["dataset"], "dataset_file.csv")
+        log("📁 Dataset file saved")
+
+    # Save requirements file (optional)
     if files.get("requirement"):
         decode_and_save(files["requirement"], "requirements.txt")
+        log("📋 Requirements file saved")
 
     os.chmod(folder, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     return folder
@@ -595,17 +638,11 @@ def clear_all_containers(full_cleanup=False):
 def graceful_exit(signum=None, frame=None):
     """
     Called for SIGINT / SIGTERM or explicit manual shutdown.
-    Will:
-      - stop the active container (if any)
-      - write 'execution stopped by worker' into result file for current task
-      - upload result + usage to server
-      - perform full cleanup (close Docker Desktop + WSL)
-      - secure-delete task folder
     """
     global active_container, current_folder, current_customer_id, current_usage_log, heartbeat_stop
 
     log("\n🛑 Shutdown signal received. Cleaning up...")
-    send_update("\n🛑 Shutdown signal received from worker. Cleaning up...")
+    send_update("🛑 Worker shutdown initiated")
     shutdown_flag.set()
 
     # stop heartbeat thread if running
@@ -619,7 +656,6 @@ def graceful_exit(signum=None, frame=None):
     try:
         if active_container:
             log("🧩 Stopping active Docker container...")
-            send_update()
             try:
                 active_container.stop(timeout=5)
             except Exception:
@@ -629,7 +665,6 @@ def graceful_exit(signum=None, frame=None):
             except Exception:
                 pass
             log("✅ Container stopped and removed.")
-            send_update("✅ Container stopped and removed.")
     except Exception as e:
         log(f"⚠️ Failed to stop container: {e}")
 
@@ -640,23 +675,15 @@ def graceful_exit(signum=None, frame=None):
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("execution stopped by worker")
             log("📝 Result file updated: execution stopped by worker")
-            send_update("completed")
+            
+            # Collect any output files before upload
+            output_files = collect_output_files(current_folder)
+            
+            # Upload final result
+            usage_bytes = json.dumps(current_usage_log).encode()
+            upload_result(current_customer_id or "unknown", worker_id, b"execution stopped by worker", usage_bytes, output_files)
         except Exception as e:
             log(f"⚠️ Failed to write result file: {e}")
-
-        # prepare usage bytes (from current_usage_log) and upload
-        try:
-            usage_bytes = json.dumps(current_usage_log).encode()
-            # if server expects multipart, reuse upload_result
-            upload_result(current_customer_id or "unknown", worker_id, b"execution stopped by worker", usage_bytes)
-        except Exception as e:
-            log(f"⚠️ Failed to upload stop result: {e}")
-
-    # notify server worker exit endpoint (best-effort)
-    try:
-        requests.post(f"{SERVER_URL}/workerexit", json={"workerId": worker_id}, timeout=3)
-    except Exception:
-        pass
 
     # Full cleanup (close docker + wsl)
     try:
@@ -685,26 +712,49 @@ signal.signal(signal.SIGTERM, graceful_exit)
 # =====================================================
 
 def main_worker():
-    global current_folder, current_customer_id, current_usage_log, heartbeat_stop
+    global current_folder, current_customer_id, current_task_id, current_usage_log, heartbeat_stop
 
     while not shutdown_flag.is_set():
         if not check_server():
-            log("Server not available. Retrying in 5s...")
+            log("❌ Server not available. Retrying in 5s...")
             sleep(5)
             continue
 
-        customer_id_local, task_id, files = claim_task()
+        # Check if tasks are available first
+        try:
+            r = requests.get(f"{SERVER_URL}/askfortask", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if not data.get("tasksAvailable", False):
+                    log("💤 No tasks available. Retrying in 5s...")
+                    sleep(5)
+                    continue
+        except Exception as e:
+            log(f"⚠️ Task availability check failed: {e}")
+            sleep(5)
+            continue
+
+        customer_id_local, task_id, files, assignment = claim_task()
         if not task_id:
-            log("ℹ️ No task available. Retrying in 5s...")
+            log("ℹ️ No task claimed. Retrying in 5s...")
             sleep(5)
             continue
 
         log(f"⚡ Claimed task {task_id} for customer {customer_id_local}")
-        folder = save_files(customer_id_local, files)
+        if assignment:
+            log(f"📊 Assignment: Worker {assignment.get('workerIndex', 0) + 1} of {assignment.get('totalWorkers', 1)}")
+        
+        try:
+            folder = save_files(customer_id_local, files)
+        except Exception as e:
+            log(f"❌ Failed to save files: {e}")
+            sleep(5)
+            continue
 
         # save globals for this run
         current_folder = folder
         current_customer_id = customer_id_local
+        current_task_id = task_id
         current_usage_log = []
 
         try:
@@ -713,7 +763,7 @@ def main_worker():
         except Exception as e:
             log(f"⚠️ Encryption step failed: {e}")
 
-        # start heartbeat for this worker run (keeps running between tasks as well)
+        # start heartbeat for this worker run
         if heartbeat_stop is None:
             heartbeat_stop = start_heartbeat()
         else:
@@ -730,18 +780,15 @@ def main_worker():
             log("🔓 Files decrypted for execution.")
             result = run_in_docker(folder, worker_id, customer_id_local)
             log(f"✅ Docker finished. Exit code: {result['exit_code']}")
+            
+            # Log output files info
+            if result.get('output_files'):
+                log(f"📦 Generated {len(result['output_files'])} output files")
         except Exception as e:
             log(f"❌ Docker execution failed: {e}")
-            send_update(f"docker_failed: {e}")
+            send_update(f"❌ Docker execution failed: {e}")
         finally:
-            # stop per-task heartbeat activity (we keep the heartbeat thread running between tasks,
-            # but if you prefer to pause it per-task you can toggle the event)
-            try:
-                # keep heartbeat_running between tasks, do not set stop event here
-                pass
-            except Exception:
-                pass
-
+            # Cleanup current task
             try:
                 log("🧹 Securely deleting files and folder...")
                 secure_delete_folder(folder)
@@ -749,12 +796,17 @@ def main_worker():
             except Exception as e:
                 log(f"⚠️ Cleanup failed: {e}")
 
-            log("🚿 Clearing Docker containers for next task (but keeping Docker/WSL alive)...")
+            # Reset current task state
+            current_folder = None
+            current_customer_id = None
+            current_task_id = None
+            current_usage_log = []
+
+            log("🚿 Clearing Docker containers for next task...")
             clear_all_containers(full_cleanup=False)
 
-        send_update("completed")
         log("✅ Task completed. Waiting for next task...\n")
-        sleep(5)
+        sleep(2)
 
 # =====================================================
 #               CANCEL TASK CHECKER
@@ -766,14 +818,14 @@ def start_cancel_monitor(customer_id_local):
     If cancel=True, stop current task gracefully.
     """
     def loop():
-        while not shutdown_flag.is_set():
+        while not shutdown_flag.is_set() and current_customer_id == customer_id_local:
             try:
                 r = requests.get(f"{SERVER_URL}/canceltask", params={"customerId": customer_id_local, "workerId": worker_id}, timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("cancel") is True:
                         log("🛑 Cancel signal received from server.")
-                        send_update("Task cancelled by user.")
+                        send_update("🛑 Task cancelled by user")
                         # Trigger shutdown for current task only
                         try:
                             if active_container:
@@ -787,7 +839,10 @@ def start_cancel_monitor(customer_id_local):
                             result_file = os.path.join(current_folder, "result_output.txt")
                             with open(result_file, "w", encoding="utf-8") as f:
                                 f.write("execution cancelled by user")
-                            upload_result(current_customer_id or "unknown", worker_id, b"execution cancelled by user", json.dumps(current_usage_log).encode())
+                            
+                            # Collect output files before upload
+                            output_files = collect_output_files(current_folder)
+                            upload_result(current_customer_id or "unknown", worker_id, b"execution cancelled by user", json.dumps(current_usage_log).encode(), output_files)
                         shutdown_flag.set()
                         break
             except Exception as e:
@@ -818,4 +873,7 @@ if __name__ == "__main__":
     try:
         main_worker()
     except KeyboardInterrupt:
+        graceful_exit()
+    except Exception as e:
+        log(f"❌ Unexpected error in main worker: {e}")
         graceful_exit()
