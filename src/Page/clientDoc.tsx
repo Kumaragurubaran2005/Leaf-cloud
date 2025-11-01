@@ -107,17 +107,18 @@ class ApiService {
     return resp.json();
   }
 
-  async downloadFile(url: string): Promise<Blob> {
-    const resp = await fetch(`${this.baseurl}${url}`, {
+  async deleteClientDocuments(customerId: string): Promise<{ success: boolean; message: string }> {
+    const resp = await fetch(`${this.baseurl}/client/documents/${customerId}`, {
+      method: 'DELETE',
       headers: { Authorization: `Bearer ${this.token}` },
     });
 
     if (!resp.ok) {
       const errorText = await resp.text();
-      throw new Error(errorText || `Download failed: ${resp.status}`);
+      throw new Error(errorText || `Failed to delete client documents: ${resp.status}`);
     }
 
-    return resp.blob();
+    return resp.json();
   }
 
   async downloadAllDocuments(customerId: string): Promise<Blob> {
@@ -172,12 +173,76 @@ const getBaseUrl = (): string => {
   return "http://localhost:5000";
 };
 
+// Delete Confirmation Modal Component
+const DeleteConfirmationModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  clientName: string;
+  clientId: string;
+  loading: boolean;
+}> = ({ isOpen, onClose, onConfirm, clientName, clientId, loading }) => {
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl p-6 max-w-md w-full mx-4">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
+            <span className="text-red-600 text-xl">⚠️</span>
+          </div>
+          <h3 className="text-lg font-semibold text-gray-800">Delete Client Documents</h3>
+        </div>
+        
+        <div className="mb-6">
+          <p className="text-gray-600 mb-2">
+            Are you sure you want to delete all documents for <strong>{clientName}</strong>?
+          </p>
+          <p className="text-sm text-gray-500">Client ID: {clientId}</p>
+          <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg">
+            <p className="text-sm text-red-700 font-medium">⚠️ This action cannot be undone!</p>
+            <p className="text-xs text-red-600 mt-1">
+              All uploaded files, usage data, and results will be permanently deleted.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex gap-3 justify-end">
+          <button
+            onClick={onClose}
+            disabled={loading}
+            className="px-4 py-2 text-gray-600 hover:text-gray-800 transition disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={loading}
+            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition disabled:opacity-50 flex items-center gap-2"
+          >
+            {loading ? (
+              <>
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                Deleting...
+              </>
+            ) : (
+              'Delete Documents'
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // Client List Component
 const ClientList: React.FC<{
   clients: ClientSummary[];
   onSelectClient: (clientId: string) => void;
+  onDeleteClient: (clientId: string, clientName: string) => void;
   loading: boolean;
-}> = ({ clients, onSelectClient, loading }) => {
+  deletingClientId: string | null;
+}> = ({ clients, onSelectClient, onDeleteClient, loading, deletingClientId }) => {
   if (loading) {
     return (
       <div className="text-center py-8">
@@ -243,12 +308,28 @@ const ClientList: React.FC<{
               <span className="text-sm text-gray-500">
                 Total: {formatFileSize(client.totalSize)}
               </span>
-              <button
-                onClick={() => onSelectClient(client.customerId)}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition text-sm font-medium"
-              >
-                View Details
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onSelectClient(client.customerId)}
+                  className="px-3 py-1 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition text-sm font-medium"
+                >
+                  View
+                </button>
+                <button
+                  onClick={() => onDeleteClient(client.customerId, client.customerName)}
+                  disabled={deletingClientId === client.customerId}
+                  className="px-3 py-1 bg-red-600 text-white rounded-lg hover:bg-red-700 transition text-sm font-medium disabled:opacity-50 flex items-center gap-1"
+                >
+                  {deletingClientId === client.customerId ? (
+                    <>
+                      <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      Deleting...
+                    </>
+                  ) : (
+                    'Delete'
+                  )}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -260,12 +341,16 @@ const ClientList: React.FC<{
 // Client Details Component
 const ClientDetails: React.FC<{
   clientId: string;
+  clientName: string;
   onBack: () => void;
+  onDelete: (clientId: string, clientName: string) => void;
   apiService: ApiService;
-}> = ({ clientId, onBack, apiService }) => {
+  deleting: boolean;
+}> = ({ clientId, clientName, onBack, onDelete, apiService, deleting }) => {
   const [documents, setDocuments] = useState<ClientDocument | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
 
   useEffect(() => {
     loadDocuments();
@@ -285,18 +370,14 @@ const ClientDetails: React.FC<{
     }
   };
 
-  const downloadFile = async (url: string, filename: string) => {
+  const handleDelete = async () => {
     try {
-      const blob = await apiService.downloadFile(url);
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(link.href);
+      await onDelete(clientId, clientName);
+      setShowDeleteModal(false);
+      onBack(); // Go back to list after successful deletion
     } catch (err) {
-      alert(`Download failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      // Error is handled in the parent component
+      setShowDeleteModal(false);
     }
   };
 
@@ -398,6 +479,20 @@ const ClientDetails: React.FC<{
             Refresh
           </button>
           <button
+            onClick={() => setShowDeleteModal(true)}
+            disabled={deleting}
+            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition text-sm disabled:opacity-50 flex items-center gap-2"
+          >
+            {deleting ? (
+              <>
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                Deleting...
+              </>
+            ) : (
+              'Delete All'
+            )}
+          </button>
+          <button
             onClick={downloadAllDocuments}
             className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition text-sm"
           >
@@ -449,19 +544,7 @@ const ClientDetails: React.FC<{
                     {fileInfo.available ? 'Available' : 'Not Available'}
                   </span>
                 </div>
-                {fileInfo.available && (
-                  <>
-                    <p className="text-sm text-gray-600 mb-3">
-                      Size: {formatFileSize(fileInfo.size)}
-                    </p>
-                    <button
-                      onClick={() => downloadFile(fileInfo.downloadUrl, `${key}_${clientId}`)}
-                      className="w-full px-3 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition text-sm"
-                    >
-                      Download {key}
-                    </button>
-                  </>
-                )}
+                
               </div>
             ))}
           </div>
@@ -554,6 +637,16 @@ const ClientDetails: React.FC<{
           )}
         </div>
       </div>
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmationModal
+        isOpen={showDeleteModal}
+        onClose={() => setShowDeleteModal(false)}
+        onConfirm={handleDelete}
+        clientName={documents.customerName}
+        clientId={documents.customerId}
+        loading={deleting}
+      />
     </div>
   );
 };
@@ -565,6 +658,9 @@ const ClientDocumentsPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
+  const [selectedClientName, setSelectedClientName] = useState<string>("");
+  const [deletingClientId, setDeletingClientId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const baseurl = getBaseUrl();
   const token = localStorage.getItem("authToken") || "";
@@ -593,12 +689,45 @@ const ClientDocumentsPage = () => {
   };
 
   const handleSelectClient = (clientId: string) => {
+    const client = clients.find(c => c.customerId === clientId);
     setSelectedClientId(clientId);
+    setSelectedClientName(client?.customerName || "");
   };
 
   const handleBackToList = () => {
     setSelectedClientId(null);
+    setSelectedClientName("");
     loadClients(); // Refresh the list when going back
+  };
+
+  const handleDeleteClient = async (clientId: string, clientName: string) => {
+    setDeletingClientId(clientId);
+    setDeleteError(null);
+
+    try {
+      const result = await apiService.deleteClientDocuments(clientId);
+      
+      if (result.success) {
+        // Remove the client from the list
+        setClients(prev => prev.filter(client => client.customerId !== clientId));
+        
+        // Show success message
+        alert(`Successfully deleted all documents for ${clientName}`);
+        
+        // If we're currently viewing the deleted client, go back to list
+        if (selectedClientId === clientId) {
+          handleBackToList();
+        }
+      } else {
+        throw new Error(result.message || 'Failed to delete documents');
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to delete documents';
+      setDeleteError(errorMessage);
+      alert(`Delete failed: ${errorMessage}`);
+    } finally {
+      setDeletingClientId(null);
+    }
   };
 
   return (
@@ -646,12 +775,32 @@ const ClientDocumentsPage = () => {
           </div>
         )}
 
+        {/* Delete Error Display */}
+        {deleteError && (
+          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-red-700 font-medium">Delete Error: {deleteError}</p>
+              </div>
+              <button
+                onClick={() => setDeleteError(null)}
+                className="px-3 py-1 bg-red-600 text-white rounded text-sm hover:bg-red-700 transition"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Content */}
         {selectedClientId ? (
           <ClientDetails
             clientId={selectedClientId}
+            clientName={selectedClientName}
             onBack={handleBackToList}
+            onDelete={handleDeleteClient}
             apiService={apiService}
+            deleting={deletingClientId === selectedClientId}
           />
         ) : (
           <div>
@@ -666,7 +815,9 @@ const ClientDocumentsPage = () => {
             <ClientList
               clients={clients}
               onSelectClient={handleSelectClient}
+              onDeleteClient={handleDeleteClient}
               loading={loading}
+              deletingClientId={deletingClientId}
             />
           </div>
         )}
