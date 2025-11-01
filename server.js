@@ -41,7 +41,7 @@ async function runQuery(sql, binds = {}, options = {}) {
   let conn;
   try {
     conn = await oracledb.getConnection(dbConfig);
-    const result = await conn.execute(sql, binds, options);
+    const result = await conn.execute(sql, binds, { ...options, outFormat: oracledb.OUT_FORMAT_OBJECT });
     await conn.commit();
     return result;
   } catch (err) {
@@ -49,6 +49,48 @@ async function runQuery(sql, binds = {}, options = {}) {
     throw err;
   } finally {
     if (conn) await conn.close();
+  }
+}
+
+// Safe data extraction from Oracle results
+function extractSafeData(rows) {
+  if (!rows || !Array.isArray(rows)) return [];
+  
+  return rows.map(row => {
+    const safeRow = {};
+    for (const key in row) {
+      if (Object.prototype.hasOwnProperty.call(row, key)) {
+        // Extract primitive values only, avoid circular references
+        const value = row[key];
+        if (value === null || value === undefined) {
+          safeRow[key] = value;
+        } else if (typeof value === 'object') {
+          // Handle Oracle specific objects
+          if (value instanceof Date) {
+            safeRow[key] = value.toISOString();
+          } else if (typeof value.toString === 'function' && !(value instanceof Buffer)) {
+            safeRow[key] = value.toString();
+          } else {
+            safeRow[key] = value;
+          }
+        } else {
+          safeRow[key] = value;
+        }
+      }
+    }
+    return safeRow;
+  });
+}
+
+// -------------------- WORKER VALIDATION --------------------
+async function validateWorker(workerId) {
+  try {
+    const sql = "SELECT * FROM users WHERE TRIM(username) = TRIM(:workerId) AND feild = 'resource_provider'";
+    const result = await runQuery(sql, { workerId });
+    return result.rows.length > 0;
+  } catch (err) {
+    console.error("Error validating worker:", err);
+    return false;
   }
 }
 
@@ -81,10 +123,39 @@ function splitDataset(buffer, numParts) {
   return chunks;
 }
 
-// Parse usage data from buffer
+// Parse usage data from buffer - UPDATED FOR NEW FORMAT
 function parseUsageData(usageBuffer) {
   try {
     const usageText = usageBuffer.toString();
+    
+    // Try to parse as JSON first (for the new format)
+    try {
+      const jsonData = JSON.parse(usageText);
+      
+      // If it's an array of usage objects (new format)
+      if (Array.isArray(jsonData) && jsonData.length > 0) {
+        const firstEntry = jsonData[0];
+        
+        // Calculate averages from all entries
+        const avgCpu = jsonData.reduce((sum, entry) => sum + (entry.cpu_percent || 0), 0) / jsonData.length;
+        const avgMemory = jsonData.reduce((sum, entry) => sum + (entry.mem_usage_MB || 0), 0) / jsonData.length;
+        const executionTime = jsonData.length; // Assuming 1 second per entry
+        
+        return {
+          cpu: parseFloat(avgCpu.toFixed(2)),
+          memory: parseFloat(avgMemory.toFixed(2)),
+          executionTime: executionTime,
+          timestamp: new Date().toISOString(),
+          rawData: usageText,
+          entriesCount: jsonData.length
+        };
+      }
+    } catch (jsonError) {
+      // If JSON parsing fails, fall back to text parsing (old format)
+      console.log("Falling back to text parsing for usage data");
+    }
+
+    // Old text format parsing (for backward compatibility)
     const lines = usageText.split('\n');
     const usageData = {
       cpu: 0,
@@ -95,13 +166,13 @@ function parseUsageData(usageBuffer) {
     };
 
     lines.forEach(line => {
-      if (line.includes('CPU Usage:')) {
-        const cpuMatch = line.match(/CPU Usage:\s*([\d.]+)%/);
-        if (cpuMatch) usageData.cpu = parseFloat(cpuMatch[1]);
+      if (line.includes('CPU Usage:') || line.includes('cpu_percent')) {
+        const cpuMatch = line.match(/(CPU Usage:|cpu_percent["']?\s*:\s*)([\d.]+)/);
+        if (cpuMatch) usageData.cpu = parseFloat(cpuMatch[2]);
       }
-      if (line.includes('Memory Usage:')) {
-        const memoryMatch = line.match(/Memory Usage:\s*([\d.]+)\s*MB/);
-        if (memoryMatch) usageData.memory = parseFloat(memoryMatch[1]);
+      if (line.includes('Memory Usage:') || line.includes('mem_usage_MB')) {
+        const memoryMatch = line.match(/(Memory Usage:|mem_usage_MB["']?\s*:\s*)([\d.]+)/);
+        if (memoryMatch) usageData.memory = parseFloat(memoryMatch[2]);
       }
       if (line.includes('Execution Time:')) {
         const timeMatch = line.match(/Execution Time:\s*([\d.]+)\s*seconds/);
@@ -375,6 +446,7 @@ app.post("/register", async (req, res) => {
     });
   }
 });
+
 // Login - UPDATED
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
@@ -383,7 +455,6 @@ app.post("/login", async (req, res) => {
       "SELECT * FROM users WHERE TRIM(username)=TRIM(:username) AND TRIM(password)=TRIM(:password)";
     
     const result = await runQuery(sql, { username, password });
-    console.log(result)
     if (result.rows.length > 0) {
       const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
       // Note: Changed from 'togo' to 'feild' to match your schema
@@ -391,7 +462,7 @@ app.post("/login", async (req, res) => {
         success: true, 
         token, 
         message: "Login successful",
-        togo: result.rows[0][2] // This should be the 'feild' column
+        togo: result.rows[0]["FEILD"] // This should be the 'feild' column
       });
     }
     res.status(401).json({ success: false, message: "Invalid username or password" });
@@ -492,7 +563,7 @@ app.post(
         taskQueue.push({ customerId, taskId });
       }
 
-      // Store in database (without created_at field that doesn't exist)
+      // Store in database (using your table structure)
       try {
         await runQuery(
           `INSERT INTO files (customer_id, customername, code, dataset, requirement, num_workers)
@@ -528,6 +599,217 @@ app.post(
     }
   }
 );
+
+// -------------------- NEW ENDPOINTS FOR GETTING STORED FILES --------------------
+
+// Get stored code file
+app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    const result = await runQuery(
+      `SELECT code FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+
+    const codeBuffer = result.rows[0].CODE;
+    if (!codeBuffer) {
+      return res.status(404).json({ message: "Code file not found" });
+    }
+
+    // Set appropriate headers for download
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="code_${customerId}.py"`);
+    res.setHeader('Content-Length', codeBuffer.length);
+    
+    res.send(codeBuffer);
+    console.log(`📄 Sent code file for customer ${customerId}`);
+  } catch (err) {
+    console.error("Error fetching code file:", err);
+    res.status(500).json({ message: "Error fetching code file" });
+  }
+});
+
+// Get stored requirement file
+app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    const result = await runQuery(
+      `SELECT requirement FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+
+    const requirementBuffer = result.rows[0].REQUIREMENT;
+    if (!requirementBuffer) {
+      return res.status(404).json({ message: "Requirement file not found" });
+    }
+
+    // Set appropriate headers for download
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="requirements_${customerId}.txt"`);
+    res.setHeader('Content-Length', requirementBuffer.length);
+    
+    res.send(requirementBuffer);
+    console.log(`📄 Sent requirement file for customer ${customerId}`);
+  } catch (err) {
+    console.error("Error fetching requirement file:", err);
+    res.status(500).json({ message: "Error fetching requirement file" });
+  }
+});
+
+// Get stored dataset file
+app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    const result = await runQuery(
+      `SELECT dataset FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+
+    const datasetBuffer = result.rows[0].DATASET;
+    if (!datasetBuffer) {
+      return res.status(404).json({ message: "Dataset file not found" });
+    }
+
+    // Set appropriate headers for download
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="dataset_${customerId}"`);
+    res.setHeader('Content-Length', datasetBuffer.length);
+    
+    res.send(datasetBuffer);
+    console.log(`📄 Sent dataset file for customer ${customerId}`);
+  } catch (err) {
+    console.error("Error fetching dataset file:", err);
+    res.status(500).json({ message: "Error fetching dataset file" });
+  }
+});
+
+// Get all file information for a customer
+app.get("/files/info/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    const result = await runQuery(
+      `SELECT customer_id, customername, num_workers, 
+              CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
+              CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
+              CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
+       FROM files 
+       WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Files not found" });
+    }
+
+    const fileInfo = result.rows[0];
+    const response = {
+      customerId: fileInfo.CUSTOMER_ID,
+      customerName: fileInfo.CUSTOMERNAME,
+      numWorkers: fileInfo.NUM_WORKERS,
+      files: {
+        code: {
+          available: fileInfo.CODE_SIZE > 0,
+          size: fileInfo.CODE_SIZE,
+          downloadUrl: `/files/code/${customerId}`
+        },
+        dataset: {
+          available: fileInfo.DATASET_SIZE > 0,
+          size: fileInfo.DATASET_SIZE,
+          downloadUrl: `/files/dataset/${customerId}`
+        },
+        requirement: {
+          available: fileInfo.REQUIREMENT_SIZE > 0,
+          size: fileInfo.REQUIREMENT_SIZE,
+          downloadUrl: `/files/requirement/${customerId}`
+        }
+      }
+    };
+
+    res.json(response);
+  } catch (err) {
+    console.error("Error fetching file info:", err);
+    res.status(500).json({ message: "Error fetching file information" });
+  }
+});
+
+// Get all customer files as ZIP
+app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    const result = await runQuery(
+      `SELECT customername, code, dataset, requirement FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Files not found" });
+    }
+
+    const files = result.rows[0];
+    const customerName = files.CUSTOMERNAME;
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment(`files_${customerId}_${customerName}.zip`);
+    archive.pipe(res);
+
+    // Add code file
+    if (files.CODE) {
+      archive.append(files.CODE, { name: `code.py` });
+    }
+
+    // Add dataset file
+    if (files.DATASET) {
+      archive.append(files.DATASET, { name: `dataset` });
+    }
+
+    // Add requirement file
+    if (files.REQUIREMENT) {
+      archive.append(files.REQUIREMENT, { name: `requirements.txt` });
+    }
+
+    // Add info file
+    const info = {
+      customerId,
+      customerName,
+      exportedAt: new Date().toISOString(),
+      files: {
+        code: files.CODE ? `code.py (${files.CODE.length} bytes)` : 'Not available',
+        dataset: files.DATASET ? `dataset (${files.DATASET.length} bytes)` : 'Not available',
+        requirement: files.REQUIREMENT ? `requirements.txt (${files.REQUIREMENT.length} bytes)` : 'Not available'
+      }
+    };
+    archive.append(JSON.stringify(info, null, 2), { name: `file_info.json` });
+
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.status(500).json({ message: "Error creating ZIP file" });
+    });
+
+    archive.finalize();
+    console.log(`📦 Sent all files as ZIP for customer ${customerId}`);
+    
+  } catch (err) {
+    console.error("Error creating files ZIP:", err);
+    res.status(500).json({ message: "Error creating files package" });
+  }
+});
 
 // Get results (with usage and output files) as ZIP - WITH COMPLETION CHECK
 app.get("/getresults/:customerId", authenticateJWT, (req, res) => {
@@ -747,7 +1029,25 @@ app.post("/whatistheupdate", authenticateJWT, (req, res) => {
 // -------------------- WORKER ENDPOINTS --------------------
 
 // Check if tasks are available
-app.get("/askfortask", (req, res) => {
+app.get("/askfortask", async (req, res) => {
+  const { workerId } = req.query;
+  
+  if (!workerId) {
+    return res.status(400).json({ 
+      tasksAvailable: false,
+      message: "workerId is required" 
+    });
+  }
+
+  // Validate worker exists and is a resource provider
+  const isValidWorker = await validateWorker(workerId);
+  if (!isValidWorker) {
+    return res.status(403).json({ 
+      tasksAvailable: false,
+      message: "Unauthorized: Only registered resource providers can request tasks" 
+    });
+  }
+
   const availableTasks = taskQueue.length > 0;
   res.json({ 
     tasksAvailable: availableTasks,
@@ -760,6 +1060,14 @@ app.get("/askfortask", (req, res) => {
 app.post("/gettask", async (req, res) => {
   const { workerId } = req.body;
   if (!workerId) return res.status(400).json({ message: "workerId required" });
+  
+  // Validate worker exists and is a resource provider
+  const isValidWorker = await validateWorker(workerId);
+  if (!isValidWorker) {
+    return res.status(403).json({ 
+      message: "Unauthorized: Only registered resource providers can get tasks" 
+    });
+  }
   
   if (taskQueue.length === 0) {
     return res.json({ 
@@ -849,6 +1157,15 @@ app.post(
       
       if (!workerId || !customerId) {
         return res.status(400).json({ resp: false, message: "Missing workerId or customerId" });
+      }
+
+      // Validate worker exists and is a resource provider
+      const isValidWorker = await validateWorker(workerId);
+      if (!isValidWorker) {
+        return res.status(403).json({ 
+          resp: false, 
+          message: "Unauthorized: Only registered resource providers can upload results" 
+        });
       }
 
       // Group files by fieldname
@@ -968,7 +1285,8 @@ app.post(
       console.error("❌ /uploadresult error:", err);
       res.status(500).json({ 
         resp: false, 
-        message: "Internal server error during result upload" 
+        message: "Internal server error during result upload",
+        error: err.message 
       });
     }
   }
@@ -982,6 +1300,15 @@ app.get("/worker/usage/:workerId", async (req, res) => {
   const { days = 30, limit = 100 } = req.query;
 
   try {
+    // Validate worker exists and is a resource provider
+    const isValidWorker = await validateWorker(workerId);
+    if (!isValidWorker) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Unauthorized: Only registered resource providers can access usage data" 
+      });
+    }
+
     const result = await runQuery(
       `SELECT 
         usage_id,
@@ -998,19 +1325,26 @@ app.get("/worker/usage/:workerId", async (req, res) => {
          AND timestamp >= SYSDATE - :days
        ORDER BY timestamp DESC
        FETCH FIRST :limit ROWS ONLY`,
-      { workerId, days: parseInt(days), limit: parseInt(limit) }
+      { 
+        workerId: workerId,
+        days: parseInt(days), 
+        limit: parseInt(limit) 
+      }
     );
 
-    const usageStats = result.rows.map(row => ({
-      usageId: row[0],
-      workerId: row[1],
-      customerId: row[2],
-      taskId: row[3],
-      cpuUsage: row[4],
-      memoryUsage: row[5],
-      executionTime: row[6],
-      timestamp: row[7],
-      rawUsageData: row[8]
+    // Use safe data extraction
+    const safeRows = extractSafeData(result.rows);
+    
+    const usageStats = safeRows.map(row => ({
+      usageId: row.USAGE_ID,
+      workerId: row.WORKER_ID,
+      customerId: row.CUSTOMER_ID,
+      taskId: row.TASK_ID,
+      cpuUsage: row.CPU_USAGE,
+      memoryUsage: row.MEMORY_USAGE,
+      executionTime: row.EXECUTION_TIME,
+      timestamp: row.TIMESTAMP,
+      rawUsageData: row.RAW_USAGE_DATA
     }));
 
     res.json({
@@ -1019,9 +1353,9 @@ app.get("/worker/usage/:workerId", async (req, res) => {
       totalRecords: usageStats.length,
       usageStats,
       summary: {
-        avgCpu: usageStats.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / usageStats.length || 0,
-        avgMemory: usageStats.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / usageStats.length || 0,
-        avgExecutionTime: usageStats.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / usageStats.length || 0,
+        avgCpu: usageStats.length > 0 ? usageStats.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / usageStats.length : 0,
+        avgMemory: usageStats.length > 0 ? usageStats.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / usageStats.length : 0,
+        avgExecutionTime: usageStats.length > 0 ? usageStats.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / usageStats.length : 0,
         totalTasks: usageStats.length
       }
     });
@@ -1029,7 +1363,8 @@ app.get("/worker/usage/:workerId", async (req, res) => {
     console.error("Error fetching worker usage data:", err);
     res.status(500).json({ 
       success: false, 
-      message: "Error fetching usage data" 
+      message: "Error fetching usage data",
+      error: err.toString() 
     });
   }
 });
@@ -1052,12 +1387,15 @@ app.get("/task/usage/:taskId", async (req, res) => {
       { taskId }
     );
 
-    const taskUsage = result.rows.map(row => ({
-      workerId: row[0],
-      cpuUsage: row[1],
-      memoryUsage: row[2],
-      executionTime: row[3],
-      timestamp: row[4]
+    // Use safe data extraction
+    const safeRows = extractSafeData(result.rows);
+    
+    const taskUsage = safeRows.map(row => ({
+      workerId: row.WORKER_ID,
+      cpuUsage: row.CPU_USAGE,
+      memoryUsage: row.MEMORY_USAGE,
+      executionTime: row.EXECUTION_TIME,
+      timestamp: row.TIMESTAMP
     }));
 
     res.json({
@@ -1066,16 +1404,17 @@ app.get("/task/usage/:taskId", async (req, res) => {
       totalWorkers: taskUsage.length,
       usageStats: taskUsage,
       averages: {
-        cpu: taskUsage.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / taskUsage.length || 0,
-        memory: taskUsage.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / taskUsage.length || 0,
-        executionTime: taskUsage.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / taskUsage.length || 0
+        cpu: taskUsage.length > 0 ? taskUsage.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / taskUsage.length : 0,
+        memory: taskUsage.length > 0 ? taskUsage.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / taskUsage.length : 0,
+        executionTime: taskUsage.length > 0 ? taskUsage.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / taskUsage.length : 0
       }
     });
   } catch (err) {
     console.error("Error fetching task usage data:", err);
     res.status(500).json({ 
       success: false, 
-      message: "Error fetching task usage data" 
+      message: "Error fetching task usage data",
+      error: err.toString() 
     });
   }
 });
@@ -1086,6 +1425,15 @@ app.get("/worker/usage/:workerId/download", async (req, res) => {
   const { format = 'csv' } = req.query;
 
   try {
+    // Validate worker exists and is a resource provider
+    const isValidWorker = await validateWorker(workerId);
+    if (!isValidWorker) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Unauthorized: Only registered resource providers can download usage data" 
+      });
+    }
+
     const result = await runQuery(
       `SELECT 
         cpu_usage,
@@ -1100,36 +1448,40 @@ app.get("/worker/usage/:workerId/download", async (req, res) => {
       { workerId }
     );
 
+    // Use safe data extraction
+    const safeRows = extractSafeData(result.rows);
+
     if (format === 'json') {
-      const usageData = result.rows.map(row => ({
-        timestamp: row[3],
-        taskId: row[4],
-        customerId: row[5],
-        cpuUsage: row[0],
-        memoryUsage: row[1],
-        executionTime: row[2]
+      const usageData = safeRows.map(row => ({
+        timestamp: row.TIMESTAMP,
+        taskId: row.TASK_ID,
+        customerId: row.CUSTOMER_ID,
+        cpuUsage: row.CPU_USAGE,
+        memoryUsage: row.MEMORY_USAGE,
+        executionTime: row.EXECUTION_TIME
       }));
 
       res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', `attachment; filename=usage_${workerId}.json`);
+      res.setHeader('Content-Disposition', `attachment; filename=usage_${workerId.replace(/[^a-zA-Z0-9]/g, '_')}.json`);
       res.json(usageData);
     } else {
       // CSV format
       let csv = 'Timestamp,Task ID,Customer ID,CPU Usage (%),Memory Usage (MB),Execution Time (s)\n';
       
-      result.rows.forEach(row => {
-        csv += `"${row[3]}","${row[4]}","${row[5]}",${row[0]},${row[1]},${row[2]}\n`;
+      safeRows.forEach(row => {
+        csv += `"${row.TIMESTAMP}","${row.TASK_ID}","${row.CUSTOMER_ID}",${row.CPU_USAGE},${row.MEMORY_USAGE},${row.EXECUTION_TIME}\n`;
       });
 
       res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename=usage_${workerId}.csv`);
+      res.setHeader('Content-Disposition', `attachment; filename=usage_${workerId.replace(/[^a-zA-Z0-9]/g, '_')}.csv`);
       res.send(csv);
     }
   } catch (err) {
     console.error("Error downloading usage data:", err);
     res.status(500).json({ 
       success: false, 
-      message: "Error downloading usage data" 
+      message: "Error downloading usage data",
+      error: err.toString() 
     });
   }
 });
@@ -1139,6 +1491,15 @@ app.get("/worker/performance/:workerId", async (req, res) => {
   const { workerId } = req.params;
 
   try {
+    // Validate worker exists and is a resource provider
+    const isValidWorker = await validateWorker(workerId);
+    if (!isValidWorker) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Unauthorized: Only registered resource providers can access performance data" 
+      });
+    }
+
     const result = await runQuery(
       `SELECT 
         COUNT(*) as total_tasks,
@@ -1162,28 +1523,31 @@ app.get("/worker/performance/:workerId", async (req, res) => {
       });
     }
 
-    const stats = result.rows[0];
+    // Use safe data extraction for the single row
+    const safeRows = extractSafeData(result.rows);
+    const stats = safeRows[0];
+
     const performance = {
       workerId,
-      totalTasks: stats[0],
+      totalTasks: stats.TOTAL_TASKS,
       averages: {
-        cpu: Math.round(stats[1] * 100) / 100,
-        memory: Math.round(stats[2] * 100) / 100,
-        executionTime: Math.round(stats[3] * 100) / 100
+        cpu: Math.round((stats.AVG_CPU || 0) * 100) / 100,
+        memory: Math.round((stats.AVG_MEMORY || 0) * 100) / 100,
+        executionTime: Math.round((stats.AVG_EXECUTION_TIME || 0) * 100) / 100
       },
       maximums: {
-        cpu: stats[4],
-        memory: stats[5],
-        executionTime: stats[6]
+        cpu: stats.MAX_CPU || 0,
+        memory: stats.MAX_MEMORY || 0,
+        executionTime: stats.MAX_EXECUTION_TIME || 0
       },
       timeline: {
-        firstTask: stats[7],
-        lastTask: stats[8]
+        firstTask: stats.FIRST_TASK,
+        lastTask: stats.LAST_TASK
       },
       efficiency: {
-        cpuEfficiency: Math.round((stats[1] / 100) * 10000) / 100, // Percentage of optimal CPU usage
-        memoryEfficiency: Math.round((stats[2] / 4096) * 10000) / 100, // Assuming 4GB max memory
-        speedEfficiency: stats[3] > 0 ? Math.round((300 / stats[3]) * 100) / 100 : 0 // Compared to 5min baseline
+        cpuEfficiency: Math.round(((stats.AVG_CPU || 0) / 100) * 10000) / 100, // Percentage of optimal CPU usage
+        memoryEfficiency: Math.round(((stats.AVG_MEMORY || 0) / 4096) * 10000) / 100, // Assuming 4GB max memory
+        speedEfficiency: (stats.AVG_EXECUTION_TIME || 0) > 0 ? Math.round((300 / (stats.AVG_EXECUTION_TIME || 1)) * 100) / 100 : 0 // Compared to 5min baseline
       }
     };
 
@@ -1195,15 +1559,24 @@ app.get("/worker/performance/:workerId", async (req, res) => {
     console.error("Error fetching worker performance:", err);
     res.status(500).json({ 
       success: false, 
-      message: "Error fetching performance data" 
+      message: "Error fetching performance data",
+      error: err.toString() 
     });
   }
 });
 
 // Heartbeat endpoint
-app.post("/heartbeat", (req, res) => {
+app.post("/heartbeat", async (req, res) => {
   const { workerId, customerId } = req.body;
   if (!workerId) return res.status(400).json({ message: "workerId required" });
+  
+  // Validate worker exists and is a resource provider
+  const isValidWorker = await validateWorker(workerId);
+  if (!isValidWorker) {
+    return res.status(403).json({ 
+      message: "Unauthorized: Only registered resource providers can send heartbeats" 
+    });
+  }
   
   if (customerId === "idle" || !customerId) {
     return res.json({ ok: true, status: "idle" });
@@ -1221,6 +1594,780 @@ app.post("/heartbeat", (req, res) => {
 
   customerTask.workerHeartbeats[workerId] = Date.now();
   res.json({ ok: true, status: "active", customerId });
+});
+
+// -------------------- ENHANCED CLIENT DOCUMENTS ENDPOINTS --------------------
+
+// Get all clients summary (for the new documents page)
+app.get("/clients/summary", authenticateJWT, async (req, res) => {
+  try {
+    const result = await runQuery(
+      `SELECT 
+        customer_id,
+        customername,
+        num_workers,
+        CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
+        CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
+        CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
+       FROM files 
+       ORDER BY customer_id DESC`
+    );
+
+    const clients = result.rows.map(row => ({
+      customerId: row.CUSTOMER_ID,
+      customerName: row.CUSTOMERNAME,
+      numWorkers: row.NUM_WORKERS,
+      files: {
+        code: row.CODE_SIZE > 0,
+        dataset: row.DATASET_SIZE > 0,
+        requirement: row.REQUIREMENT_SIZE > 0
+      },
+      totalSize: row.CODE_SIZE + row.DATASET_SIZE + row.REQUIREMENT_SIZE,
+      documentsUrl: `/client/documents/${row.CUSTOMER_ID}`,
+      downloadUrl: `/client/documents/${row.CUSTOMER_ID}/download/all`
+    }));
+
+    res.json({
+      success: true,
+      totalClients: clients.length,
+      totalStorage: clients.reduce((sum, client) => sum + client.totalSize, 0),
+      clients
+    });
+  } catch (err) {
+    console.error("Error fetching clients summary:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching clients summary",
+      error: err.toString() 
+    });
+  }
+});
+
+// Get client documents with enhanced information
+app.get("/client/documents/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    // First, get basic file information from files table
+    const filesResult = await runQuery(
+      `SELECT customer_id, customername, num_workers, 
+              code, dataset, requirement,
+              CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
+              CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
+              CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
+       FROM files 
+       WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (filesResult.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "No documents found for this customer" 
+      });
+    }
+
+    const fileInfo = filesResult.rows[0];
+    
+    // Get usage data for this customer
+    const usageResult = await runQuery(
+      `SELECT worker_id, task_id, cpu_usage, memory_usage, execution_time,
+              TO_CHAR(timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') as timestamp,
+              raw_usage_data
+       FROM worker_usage_stats 
+       WHERE customer_id = :customerId 
+       ORDER BY timestamp DESC`,
+      { customerId }
+    );
+
+    // Use safe data extraction
+    const safeUsageRows = extractSafeData(usageResult.rows);
+    
+    const usageStats = safeUsageRows.map(row => ({
+      workerId: row.WORKER_ID,
+      taskId: row.TASK_ID,
+      cpuUsage: row.CPU_USAGE,
+      memoryUsage: row.MEMORY_USAGE,
+      executionTime: row.EXECUTION_TIME,
+      timestamp: row.TIMESTAMP,
+      rawUsageData: row.RAW_USAGE_DATA
+    }));
+
+    // Get task completion information from memory
+    const customerTask = customers[customerId];
+    let taskStatus = null;
+    let outputFilesInfo = null;
+
+    if (customerTask) {
+      const progress = getTaskProgress(customerId);
+      taskStatus = {
+        customerId,
+        taskId: customerTask.taskId,
+        customerName: customerTask.cusname,
+        ...progress,
+        workers: customerTask.workers || [],
+        assignedWorkers: customerTask.workers.length,
+        pendingWorkers: customerTask.pendingWorkers,
+        createdAt: customerTask.createdAt,
+        completedAt: customerTask.completedAt,
+        isReadyForDownload: progress.canDownload
+      };
+
+      // Get output files information
+      if (customerTask.outputFiles) {
+        outputFilesInfo = Object.keys(customerTask.outputFiles).map(workerId => ({
+          workerId,
+          files: Object.keys(customerTask.outputFiles[workerId]).map(filename => ({
+            name: filename,
+            size: customerTask.outputFiles[workerId][filename].length,
+            downloadUrl: `/getresults/${customerId}` // Output files are included in results ZIP
+          }))
+        }));
+      }
+    }
+
+    // Get additional statistics
+    const statsResult = await runQuery(
+      `SELECT 
+        COUNT(*) as total_usage_records,
+        AVG(cpu_usage) as avg_cpu,
+        AVG(memory_usage) as avg_memory,
+        AVG(execution_time) as avg_execution_time,
+        COUNT(DISTINCT worker_id) as unique_workers
+       FROM worker_usage_stats 
+       WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    const stats = statsResult.rows[0] || {};
+
+    const response = {
+      success: true,
+      customerId: fileInfo.CUSTOMER_ID,
+      customerName: fileInfo.CUSTOMERNAME,
+      numWorkers: fileInfo.NUM_WORKERS,
+      statistics: {
+        totalUsageRecords: stats.TOTAL_USAGE_RECORDS || 0,
+        uniqueWorkers: stats.UNIQUE_WORKERS || 0,
+        avgCpu: parseFloat(stats.AVG_CPU || 0).toFixed(2),
+        avgMemory: parseFloat(stats.AVG_MEMORY || 0).toFixed(2),
+        avgExecutionTime: parseFloat(stats.AVG_EXECUTION_TIME || 0).toFixed(2)
+      },
+      documents: {
+        // Input files
+        inputFiles: {
+          code: {
+            available: fileInfo.CODE_SIZE > 0,
+            size: fileInfo.CODE_SIZE,
+            downloadUrl: `/files/code/${customerId}`,
+            filename: `code_${customerId}.py`
+          },
+          dataset: {
+            available: fileInfo.DATASET_SIZE > 0,
+            size: fileInfo.DATASET_SIZE,
+            downloadUrl: `/files/dataset/${customerId}`,
+            filename: `dataset_${customerId}`
+          },
+          requirement: {
+            available: fileInfo.REQUIREMENT_SIZE > 0,
+            size: fileInfo.REQUIREMENT_SIZE,
+            downloadUrl: `/files/requirement/${customerId}`,
+            filename: `requirements_${customerId}.txt`
+          }
+        },
+        // Usage statistics
+        usageStats: {
+          totalRecords: usageStats.length,
+          workers: [...new Set(usageStats.map(stat => stat.workerId))],
+          summary: {
+            avgCpu: usageStats.length > 0 ? usageStats.reduce((sum, stat) => sum + (stat.cpuUsage || 0), 0) / usageStats.length : 0,
+            avgMemory: usageStats.length > 0 ? usageStats.reduce((sum, stat) => sum + (stat.memoryUsage || 0), 0) / usageStats.length : 0,
+            avgExecutionTime: usageStats.length > 0 ? usageStats.reduce((sum, stat) => sum + (stat.executionTime || 0), 0) / usageStats.length : 0
+          },
+          data: usageStats
+        },
+        // Output files (if available)
+        outputFiles: outputFilesInfo || [],
+        // Task status
+        taskStatus: taskStatus
+      },
+      downloadOptions: {
+        allFiles: `/client/documents/${customerId}/download/all`,
+        inputFilesOnly: `/client/documents/${customerId}/download/inputs`,
+        resultsOnly: `/getresults/${customerId}`,
+        usageReport: `/client/documents/${customerId}/download/usage`
+      }
+    };
+
+    res.json(response);
+  } catch (err) {
+    console.error("Error fetching client documents:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching client documents",
+      error: err.toString() 
+    });
+  }
+});
+
+// Enhanced download all documents endpoint
+app.get("/client/documents/:customerId/download/all", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    // Get files from database
+    const filesResult = await runQuery(
+      `SELECT customername, code, dataset, requirement FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (filesResult.rows.length === 0) {
+      return res.status(404).json({ message: "No documents found for this customer" });
+    }
+
+    const files = filesResult.rows[0];
+    const customerName = files.CUSTOMERNAME;
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment(`client_documents_${customerId}_${customerName}.zip`);
+    archive.pipe(res);
+
+    // Add input files with proper extensions
+    if (files.CODE) {
+      archive.append(files.CODE, { name: `input_files/code.py` });
+    }
+    if (files.DATASET) {
+      // Try to determine dataset file extension
+      const datasetExtension = await getFileExtension(files.DATASET);
+      archive.append(files.DATASET, { name: `input_files/dataset${datasetExtension}` });
+    }
+    if (files.REQUIREMENT) {
+      archive.append(files.REQUIREMENT, { name: `input_files/requirements.txt` });
+    }
+
+    // Get enhanced usage data
+    const usageResult = await runQuery(
+      `SELECT worker_id, task_id, cpu_usage, memory_usage, execution_time,
+              TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp,
+              raw_usage_data
+       FROM worker_usage_stats 
+       WHERE customer_id = :customerId 
+       ORDER BY timestamp ASC`,
+      { customerId }
+    );
+
+    // Create enhanced usage reports
+    if (usageResult.rows.length > 0) {
+      const safeUsageRows = extractSafeData(usageResult.rows);
+      
+      // Detailed CSV report
+      let usageCsv = 'Timestamp,Worker ID,Task ID,CPU Usage (%),Memory Usage (MB),Execution Time (s),Raw Data\n';
+      safeUsageRows.forEach(row => {
+        const rawData = row.RAW_USAGE_DATA ? `"${row.RAW_USAGE_DATA.replace(/"/g, '""')}"` : '';
+        usageCsv += `"${row.TIMESTAMP}","${row.WORKER_ID}","${row.TASK_ID}",${row.CPU_USAGE},${row.MEMORY_USAGE},${row.EXECUTION_TIME},${rawData}\n`;
+      });
+      
+      archive.append(usageCsv, { name: `reports/usage_statistics_detailed.csv` });
+
+      // Summary CSV report
+      let summaryCsv = 'Worker ID,Avg CPU (%),Avg Memory (MB),Total Execution Time (s),Records Count\n';
+      const workerSummaries = safeUsageRows.reduce((acc, row) => {
+        if (!acc[row.WORKER_ID]) {
+          acc[row.WORKER_ID] = {
+            workerId: row.WORKER_ID,
+            cpuSum: 0,
+            memorySum: 0,
+            executionSum: 0,
+            count: 0
+          };
+        }
+        acc[row.WORKER_ID].cpuSum += row.CPU_USAGE;
+        acc[row.WORKER_ID].memorySum += row.MEMORY_USAGE;
+        acc[row.WORKER_ID].executionSum += row.EXECUTION_TIME;
+        acc[row.WORKER_ID].count++;
+        return acc;
+      }, {});
+
+      Object.values(workerSummaries).forEach(summary => {
+        summaryCsv += `"${summary.workerId}",${(summary.cpuSum / summary.count).toFixed(2)},${(summary.memorySum / summary.count).toFixed(2)},${summary.executionSum.toFixed(2)},${summary.count}\n`;
+      });
+      
+      archive.append(summaryCsv, { name: `reports/usage_statistics_summary.csv` });
+
+      // Enhanced usage summary JSON
+      const usageSummary = {
+        customerId,
+        customerName,
+        totalUsageRecords: safeUsageRows.length,
+        uniqueWorkers: Object.keys(workerSummaries).length,
+        timeRange: {
+          start: safeUsageRows[0]?.TIMESTAMP,
+          end: safeUsageRows[safeUsageRows.length - 1]?.TIMESTAMP
+        },
+        summary: {
+          overall: {
+            avgCpu: safeUsageRows.reduce((sum, row) => sum + (row.CPU_USAGE || 0), 0) / safeUsageRows.length,
+            avgMemory: safeUsageRows.reduce((sum, row) => sum + (row.MEMORY_USAGE || 0), 0) / safeUsageRows.length,
+            totalExecutionTime: safeUsageRows.reduce((sum, row) => sum + (row.EXECUTION_TIME || 0), 0)
+          },
+          byWorker: Object.values(workerSummaries).map(ws => ({
+            workerId: ws.workerId,
+            avgCpu: (ws.cpuSum / ws.count),
+            avgMemory: (ws.memorySum / ws.count),
+            totalExecutionTime: ws.executionSum,
+            recordsCount: ws.count
+          }))
+        }
+      };
+      archive.append(JSON.stringify(usageSummary, null, 2), { name: `reports/usage_summary.json` });
+    }
+
+    // Add enhanced task information
+    const customerTask = customers[customerId];
+    if (customerTask) {
+      const taskInfo = {
+        customerId,
+        taskId: customerTask.taskId,
+        customerName: customerTask.cusname,
+        numWorkers: customerTask.numWorkers,
+        workers: customerTask.workers || [],
+        status: getTaskProgress(customerId),
+        timeline: {
+          createdAt: customerTask.createdAt,
+          startedAt: customerTask.workers.length > 0 ? customerTask.createdAt : null,
+          completedAt: customerTask.completedAt
+        },
+        outputFiles: customerTask.outputFiles ? 
+          Object.keys(customerTask.outputFiles).reduce((acc, workerId) => {
+            acc[workerId] = {
+              files: Object.keys(customerTask.outputFiles[workerId]),
+              totalSize: Object.values(customerTask.outputFiles[workerId]).reduce((sum, buffer) => sum + buffer.length, 0)
+            };
+            return acc;
+          }, {}) : {}
+      };
+      archive.append(JSON.stringify(taskInfo, null, 2), { name: `task_information.json` });
+    }
+
+    // Add file manifest
+    const manifest = {
+      customerId,
+      customerName,
+      exportedAt: new Date().toISOString(),
+      totalFiles: [
+        files.CODE ? 'input_files/code.py' : null,
+        files.DATASET ? 'input_files/dataset' : null,
+        files.REQUIREMENT ? 'input_files/requirements.txt' : null,
+        'reports/usage_statistics_detailed.csv',
+        'reports/usage_statistics_summary.csv',
+        'reports/usage_summary.json',
+        'task_information.json',
+        'README.txt'
+      ].filter(Boolean).length,
+      fileSizes: {
+        code: files.CODE ? files.CODE.length : 0,
+        dataset: files.DATASET ? files.DATASET.length : 0,
+        requirement: files.REQUIREMENT ? files.REQUIREMENT.length : 0
+      }
+    };
+    archive.append(JSON.stringify(manifest, null, 2), { name: `manifest.json` });
+
+    // Add comprehensive readme
+    const readme = `CLIENT DOCUMENTS ARCHIVE
+=======================
+
+Customer Information:
+-------------------
+Customer ID: ${customerId}
+Customer Name: ${customerName}
+Export Date: ${new Date().toISOString()}
+
+Folder Structure:
+----------------
+input_files/     - Original input files submitted by client
+reports/         - Detailed usage statistics and performance reports
+
+Files Included:
+--------------
+INPUT FILES:
+1. code.py                    - Main code file
+2. dataset                    - Dataset file (if provided)
+3. requirements.txt           - Requirements file (if provided)
+
+USAGE REPORTS:
+4. usage_statistics_detailed.csv - Detailed usage data with timestamps
+5. usage_statistics_summary.csv  - Worker-wise summary statistics
+6. usage_summary.json           - Comprehensive usage analysis
+
+METADATA:
+7. task_information.json       - Complete task metadata and execution details
+8. manifest.json              - File manifest and sizes
+9. README.txt                 - This file
+
+Usage:
+------
+- Input files can be used to reproduce the task
+- Usage reports provide insights into resource consumption
+- Task information gives execution context and timing
+- Use the manifest to understand the archive contents
+
+Notes:
+------
+- All timestamps are in UTC
+- File sizes are in bytes
+- CPU usage is measured in percentage
+- Memory usage is measured in MB
+- Execution time is measured in seconds
+
+Total Files: ${manifest.totalFiles}
+Total Size: ${formatFileSize(Object.values(manifest.fileSizes).reduce((a, b) => a + b, 0))}
+`;
+    archive.append(readme, { name: `README.txt` });
+
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.status(500).json({ message: "Error creating documents archive" });
+    });
+
+    archive.on('end', () => {
+      console.log(`📦 Sent enhanced documents archive for client ${customerId}`);
+    });
+
+    archive.finalize();
+    
+  } catch (err) {
+    console.error("Error creating enhanced documents archive:", err);
+    res.status(500).json({ message: "Error creating documents package" });
+  }
+});
+
+// Helper function to detect file extension from buffer
+async function getFileExtension(buffer) {
+  try {
+    // Simple detection based on file signatures
+    const signatures = {
+      'ffd8ffe0': '.jpg',
+      '89504e47': '.png',
+      '47494638': '.gif',
+      '25504446': '.pdf',
+      '504b0304': '.zip',
+      '504b0506': '.zip',
+      '504b0708': '.zip',
+      '377abcaf': '.7z',
+      '1f8b08': '.gz',
+      '424d': '.bmp',
+      '494433': '.mp3',
+      '000001ba': '.mpg',
+      '000001b3': '.mpg',
+      '3026b275': '.wmv',
+      '52494646': '.avi',
+      '4f676753': '.ogg',
+      '664c6143': '.flac',
+      '4d546864': '.mid',
+      'd0cf11e0': '.msi', // Also .doc, .xls, .ppt
+      '504b34': '.jar',
+      '7b5c7274': '.rtf',
+      '25215053': '.eps',
+      '25504446': '.pdf',
+      '2525454f': '.pdf',
+      '255044462d': '.pdf'
+    };
+
+    const hex = buffer.slice(0, 8).toString('hex').toLowerCase();
+    
+    for (const [signature, extension] of Object.entries(signatures)) {
+      if (hex.startsWith(signature.toLowerCase())) {
+        return extension;
+      }
+    }
+    
+    // Check for text files
+    const text = buffer.slice(0, 1000).toString();
+    if (text.includes('<?xml') || text.includes('<html')) return '.html';
+    if (text.includes('{') && text.includes('}')) return '.json';
+    if (text.includes(',') && text.split('\n')[0].split(',').length > 1) return '.csv';
+    
+    return ''; // Unknown extension
+  } catch (err) {
+    return '';
+  }
+}
+
+// Helper function to format file size
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// Delete client documents (optional cleanup endpoint)
+app.delete("/client/documents/:customerId", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    // Check if customer exists
+    const checkResult = await runQuery(
+      `SELECT customer_id FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Client documents not found" 
+      });
+    }
+
+    // Delete from database (cascade should handle related records)
+    await runQuery(
+      `DELETE FROM files WHERE customer_id = :customerId`,
+      { customerId },
+      { autoCommit: true }
+    );
+
+    // Clean up memory
+    delete customers[customerId];
+    delete taskUpdates[customerId];
+    delete cancelMap[customerId];
+
+    console.log(`🗑️ Deleted documents for client ${customerId}`);
+    
+    res.json({
+      success: true,
+      message: "Client documents deleted successfully"
+    });
+  } catch (err) {
+    console.error("Error deleting client documents:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error deleting client documents",
+      error: err.toString() 
+    });
+  }
+});
+
+// Search clients by name or ID
+app.get("/clients/search", authenticateJWT, async (req, res) => {
+  const { query } = req.query;
+  
+  if (!query || query.length < 2) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Search query must be at least 2 characters long" 
+    });
+  }
+
+  try {
+    const result = await runQuery(
+      `SELECT 
+        customer_id,
+        customername,
+        num_workers,
+        CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
+        CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
+        CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
+       FROM files 
+       WHERE UPPER(customer_id) LIKE UPPER(:query) 
+          OR UPPER(customername) LIKE UPPER(:query)
+       ORDER BY customer_id DESC`,
+      { query: `%${query}%` }
+    );
+
+    const clients = result.rows.map(row => ({
+      customerId: row.CUSTOMER_ID,
+      customerName: row.CUSTOMERNAME,
+      numWorkers: row.NUM_WORKERS,
+      files: {
+        code: row.CODE_SIZE > 0,
+        dataset: row.DATASET_SIZE > 0,
+        requirement: row.REQUIREMENT_SIZE > 0
+      },
+      totalSize: row.CODE_SIZE + row.DATASET_SIZE + row.REQUIREMENT_SIZE,
+      documentsUrl: `/client/documents/${row.CUSTOMER_ID}`,
+      downloadUrl: `/client/documents/${row.CUSTOMER_ID}/download/all`
+    }));
+
+    res.json({
+      success: true,
+      query,
+      totalResults: clients.length,
+      clients
+    });
+  } catch (err) {
+    console.error("Error searching clients:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error searching clients",
+      error: err.toString() 
+    });
+  }
+});
+
+// Update the existing /admin/clients endpoint to use the new format
+app.get("/admin/clients", authenticateJWT, async (req, res) => {
+  try {
+    const result = await runQuery(
+      `SELECT 
+        customer_id,
+        customername,
+        num_workers,
+        CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
+        CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
+        CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
+       FROM files 
+       ORDER BY customer_id DESC`
+    );
+
+    const clients = result.rows.map(row => ({
+      customerId: row.CUSTOMER_ID,
+      customerName: row.CUSTOMERNAME,
+      numWorkers: row.NUM_WORKERS,
+      files: {
+        code: row.CODE_SIZE > 0,
+        dataset: row.DATASET_SIZE > 0,
+        requirement: row.REQUIREMENT_SIZE > 0
+      },
+      totalSize: row.CODE_SIZE + row.DATASET_SIZE + row.REQUIREMENT_SIZE,
+      documentsUrl: `/client/documents/${row.CUSTOMER_ID}`,
+      downloadUrl: `/client/documents/${row.CUSTOMER_ID}/download/all`
+    }));
+
+    res.json({
+      success: true,
+      totalClients: clients.length,
+      totalStorage: clients.reduce((sum, client) => sum + client.totalSize, 0),
+      clients
+    });
+  } catch (err) {
+    console.error("Error fetching clients list:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching clients list",
+      error: err.toString() 
+    });
+  }
+});
+
+// Download only input files
+app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  
+  try {
+    const filesResult = await runQuery(
+      `SELECT customername, code, dataset, requirement FROM files WHERE customer_id = :customerId`,
+      { customerId }
+    );
+
+    if (filesResult.rows.length === 0) {
+      return res.status(404).json({ message: "No input files found for this customer" });
+    }
+
+    const files = filesResult.rows[0];
+    const customerName = files.CUSTOMERNAME;
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment(`input_files_${customerId}_${customerName}.zip`);
+    archive.pipe(res);
+
+    if (files.CODE) {
+      archive.append(files.CODE, { name: `code.py` });
+    }
+    if (files.DATASET) {
+      archive.append(files.DATASET, { name: `dataset` });
+    }
+    if (files.REQUIREMENT) {
+      archive.append(files.REQUIREMENT, { name: `requirements.txt` });
+    }
+
+    // Add file info
+    const fileInfo = {
+      customerId,
+      customerName,
+      exportedAt: new Date().toISOString(),
+      files: {
+        code: files.CODE ? `code.py (${files.CODE.length} bytes)` : 'Not available',
+        dataset: files.DATASET ? `dataset (${files.DATASET.length} bytes)` : 'Not available',
+        requirement: files.REQUIREMENT ? `requirements.txt (${files.REQUIREMENT.length} bytes)` : 'Not available'
+      }
+    };
+    archive.append(JSON.stringify(fileInfo, null, 2), { name: `file_info.json` });
+
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.status(500).json({ message: "Error creating input files archive" });
+    });
+
+    archive.finalize();
+    console.log(`📦 Sent input files archive for client ${customerId}`);
+    
+  } catch (err) {
+    console.error("Error creating input files archive:", err);
+    res.status(500).json({ message: "Error creating input files package" });
+  }
+});
+
+// Download usage report only
+app.get("/client/documents/:customerId/download/usage", authenticateJWT, async (req, res) => {
+  const { customerId } = req.params;
+  const { format = 'csv' } = req.query;
+  
+  try {
+    const usageResult = await runQuery(
+      `SELECT worker_id, task_id, cpu_usage, memory_usage, execution_time,
+              TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp,
+              raw_usage_data
+       FROM worker_usage_stats 
+       WHERE customer_id = :customerId 
+       ORDER BY timestamp ASC`,
+      { customerId }
+    );
+
+    if (usageResult.rows.length === 0) {
+      return res.status(404).json({ message: "No usage data found for this customer" });
+    }
+
+    const safeUsageRows = extractSafeData(usageResult.rows);
+
+    if (format === 'json') {
+      const usageData = safeUsageRows.map(row => ({
+        timestamp: row.TIMESTAMP,
+        workerId: row.WORKER_ID,
+        taskId: row.TASK_ID,
+        cpuUsage: row.CPU_USAGE,
+        memoryUsage: row.MEMORY_USAGE,
+        executionTime: row.EXECUTION_TIME,
+        rawUsageData: row.RAW_USAGE_DATA
+      }));
+
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename=usage_report_${customerId}.json`);
+      res.json({
+        customerId,
+        totalRecords: usageData.length,
+        usageData
+      });
+    } else {
+      // CSV format
+      let csv = 'Timestamp,Worker ID,Task ID,CPU Usage (%),Memory Usage (MB),Execution Time (s),Raw Data\n';
+      
+      safeUsageRows.forEach(row => {
+        const rawData = row.RAW_USAGE_DATA ? `"${row.RAW_USAGE_DATA.replace(/"/g, '""')}"` : '';
+        csv += `"${row.TIMESTAMP}","${row.WORKER_ID}","${row.TASK_ID}",${row.CPU_USAGE},${row.MEMORY_USAGE},${row.EXECUTION_TIME},${rawData}\n`;
+      });
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename=usage_report_${customerId}.csv`);
+      res.send(csv);
+    }
+
+    console.log(`📊 Sent usage report for client ${customerId}`);
+    
+  } catch (err) {
+    console.error("Error creating usage report:", err);
+    res.status(500).json({ message: "Error creating usage report" });
+  }
 });
 
 // -------------------- HEARTBEAT MONITOR --------------------
@@ -1284,23 +2431,37 @@ setInterval(async () => {
 app.get("/workerstats/:workerId", async (req, res) => {
   const { workerId } = req.params;
   try {
+    // Validate worker exists and is a resource provider
+    const isValidWorker = await validateWorker(workerId);
+    if (!isValidWorker) {
+      return res.status(403).json({ 
+        message: "Unauthorized: Only registered resource providers can access stats" 
+      });
+    }
+
     const result = await runQuery(
       `SELECT * FROM resource_provider WHERE workerId = :workerId`,
       { workerId }
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Worker not found" });
     
-    const stats = result.rows[0];
+    // Use safe data extraction
+    const safeRows = extractSafeData(result.rows);
+    const stats = safeRows[0];
+    
     res.json({
-      WORKERID: stats[0],
-      TASKCOMPLETED: stats[1],
-      TASKPENDING: stats[2],
-      TASKFAILED: stats[3],
-      TASKRUNNING: stats[4]
+      WORKERID: stats.WORKERID,
+      TASKCOMPLETED: stats.TASKCOMPLETED,
+      TASKPENDING: stats.TASKPENDING,
+      TASKFAILED: stats.TASKFAILED,
+      TASKRUNNING: stats.TASKRUNNING
     });
   } catch (err) {
     console.error("Error fetching worker stats:", err);
-    res.status(500).json({ message: "Server error fetching worker stats" });
+    res.status(500).json({ 
+      message: "Server error fetching worker stats",
+      error: err.toString() 
+    });
   }
 });
 
@@ -1308,6 +2469,14 @@ app.post("/workerstats", async (req, res) => {
   const { workerId } = req.body;
   
   try {
+    // Validate worker exists and is a resource provider
+    const isValidWorker = await validateWorker(workerId);
+    if (!isValidWorker) {
+      return res.status(403).json({ 
+        message: "Unauthorized: Only registered resource providers can access stats" 
+      });
+    }
+
     const sql = `SELECT * FROM resource_provider WHERE workerId = TRIM(:workerId)`;
     const result = await runQuery(sql, { workerId });
     
@@ -1315,16 +2484,23 @@ app.post("/workerstats", async (req, res) => {
       return res.status(404).json({ message: "Worker stats not found" });
     }
     
+    // Use safe data extraction
+    const safeRows = extractSafeData(result.rows);
+    const stats = safeRows[0];
+    
     res.json({
-      WORKERID: result.rows[0][0],
-      TASKCOMPLETED: result.rows[0][1],
-      TASKPENDING: result.rows[0][2],
-      TASKFAILED: result.rows[0][3],
-      TASKRUNNING: result.rows[0][4]
+      WORKERID: stats.WORKERID,
+      TASKCOMPLETED: stats.TASKCOMPLETED,
+      TASKPENDING: stats.TASKPENDING,
+      TASKFAILED: stats.TASKFAILED,
+      TASKRUNNING: stats.TASKRUNNING
     });
   } catch (err) {
     console.error("Error in /workerstats:", err);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ 
+      message: "Server error",
+      error: err.toString() 
+    });
   }
 });
 
@@ -1369,6 +2545,11 @@ app.listen(PORT, () => {
   console.log(`🎯 Completion notifications: ACTIVE`);
   console.log(`📦 Output files support: ENABLED`);
   console.log(`📈 Worker usage analytics: ENABLED`);
+  console.log(`🔒 Worker validation: ACTIVE (only registered resource providers allowed)`);
+  console.log(`📁 File retrieval endpoints: ACTIVE`);
+  console.log(`📋 Enhanced client documents endpoints: ACTIVE`);
+  console.log(`🔍 Client search functionality: ACTIVE`);
+  console.log(`📊 Client statistics: ACTIVE`);
 });
 
 export default app;

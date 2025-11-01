@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-
+import { useNavigate } from "react-router-dom";
 interface Update {
   update: string;
   timestamp?: string;
@@ -488,7 +488,7 @@ const ClientPage = () => {
   const [isCancelling, setIsCancelling] = useState(false);
   const [isCancelled, setIsCancelled] = useState(false);
   const [currentProgress, setCurrentProgress] = useState<{ submitted: number; total: number; percentage: number } | null>(null);
-
+  const navigate = useNavigate();
   // Hooks
   const { elapsedSeconds, reset: resetTimer } = useTimer(!!customerId && !isCompleted && !isCancelled);
   const { validateFile } = useFileValidation();
@@ -802,6 +802,13 @@ const ClientPage = () => {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50 py-8">
       <div className="w-full max-w-4xl p-8 bg-white rounded-3xl shadow-2xl border border-gray-200/30">
+      
+        <button
+          onClick={() => navigate('/client-documents')}
+          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition"
+        >
+          View All Documents
+        </button>
         <h2 className="text-3xl font-bold text-center mb-2 text-gray-800">Send Package</h2>
         <p className="text-center text-gray-600 mb-8">Upload your code and data for processing</p>
 
