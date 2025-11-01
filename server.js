@@ -19,7 +19,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const JWT_EXPIRES_IN = "2h";
 const canceltask = false;
 const dbConfig = {
-  user: process.env.DB_USER || "APPUSER",
+  user: process.env.DB_USER || "APP",
   password: process.env.DB_PASSWORD || "2005",
   connectString: process.env.DB_CONNECT || "localhost:1521/FREEPDB1",
 };
@@ -119,7 +119,7 @@ app.post("/login", async (req, res) => {
   try {
     const sql =
       "SELECT * FROM users WHERE TRIM(username)=TRIM(:username) AND TRIM(password)=TRIM(:password)";
-    console.log(username+password)
+    
     const result = await runQuery(sql, { username, password });
     console.log(result)
     if (result.rows.length > 0) {

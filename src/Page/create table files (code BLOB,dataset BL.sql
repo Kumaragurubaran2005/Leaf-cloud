@@ -12,8 +12,8 @@ CREATE TABLE users (username VARCHAR(20) not NULL,password VARCHAR(20) not NULL,
 
 
 
-INSERT INTO resource_provider
-VALUES ('Kumar', 1,1,1,1);
+INSERT INTO users
+VALUES ('Kumar', '2005','client');
 commit;
 SELECT * FROM users WHERE username='kumar' and password='2005';
 
