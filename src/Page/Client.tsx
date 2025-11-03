@@ -451,7 +451,7 @@ const UpdatesList: React.FC<{
         <h3 className="font-semibold text-lg text-gray-800">Job Updates:</h3>
         {currentProgress && (
           <div className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium">
-            Progress: {currentProgress.submitted}/{currentProgress.total} ({currentProgress.centage}%)
+            Progress: {currentProgress.submitted}/{currentProgress.total} ({currentProgress.percentage}%)
           </div>
         )}
       </div>

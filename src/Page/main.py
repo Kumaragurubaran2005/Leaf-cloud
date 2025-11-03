@@ -37,6 +37,7 @@ current_task_id = None
 current_usage_log = []            # list of usage dicts collected during run
 heartbeat_stop = None             # threading.Event returned by start_heartbeat()
 docker_client = None              # cached docker client (docker.from_env())
+original_filenames = {}           # NEW: Store original filenames from server
 
 # =====================================================
 #               KEY MANAGEMENT / FERNET
@@ -99,7 +100,7 @@ def collect_output_files(folder_path):
     output_files = {}
     
     # Common output file extensions to look for
-    output_extensions = {'.csv', '.txt', '.json', '.xlsx', '.xls', '.png', '.jpg', '.jpeg', '.pdf'}
+    output_extensions = {'.csv', '.txt', '.json', '.xlsx', '.xls', '.png', '.jpg', '.jpeg', '.pdf', '.out', '.log', '.result'}
     
     for root, dirs, files in os.walk(folder_path):
         for file in files:
@@ -308,11 +309,11 @@ def ensure_docker_running():
             log(f"❌ Docker still not running: {e}")
             return False
 
-def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="code_file.py", requirements_file="requirements.txt",
+def run_in_docker(folder_path, worker_id_local, customer_id_local, code_filename="code_file.py", requirements_filename="requirements.txt",
                   cpu_limit=1.0, mem_limit="512m", image="python:3.11-slim"):
     """Run user code in Docker container and monitor it."""
 
-    global active_container, current_folder, current_customer_id, current_usage_log, docker_client
+    global active_container, current_folder, current_customer_id, current_usage_log, docker_client, original_filenames
 
     current_folder = folder_path
     current_customer_id = customer_id_local
@@ -330,13 +331,14 @@ def run_in_docker(folder_path, worker_id_local, customer_id_local, code_file="co
 
     commands = []
     pip_log = "/app/pip_install.log"
-    req_path = os.path.join(abs_folder, requirements_file)
+    req_path = os.path.join(abs_folder, requirements_filename)
 
     if os.path.exists(req_path) and os.path.getsize(req_path) > 0:
-        commands.append(f"pip install --no-cache-dir -r /app/{requirements_file} > {pip_log} 2>&1")
+        commands.append(f"pip install --no-cache-dir -r /app/{requirements_filename} > {pip_log} 2>&1")
         send_update("📦 Installing dependencies...")
 
-    commands.append(f"python /app/{code_file}")
+    # Use the original code filename for execution
+    commands.append(f"python /app/{code_filename}")
     final_cmd = " && ".join(commands)
 
     try:
@@ -474,54 +476,82 @@ def claim_task():
         data = r.json()
         
         if not data.get("taskAvailable", False):
-            return None, None, None, None
+            return None, None, None, None, None
             
         # Get task details with new server response format
         task_id = data.get("taskId")
         customer_id = data.get("customerId")
         files = data.get("files", {})
         assignment = data.get("assignment", {})
+        original_filenames = data.get("originalFilenames", {})  # NEW: Get original filenames
         
         log(f"📥 Received task: customer={customer_id}, task={task_id}, worker_index={assignment.get('workerIndex')}/{assignment.get('totalWorkers')}")
         
-        return customer_id, task_id, files, assignment
+        # Log original filenames if available
+        if original_filenames:
+            log(f"📁 Original filenames: Code={original_filenames.get('code', 'N/A')}, Dataset={original_filenames.get('dataset', 'N/A')}, Requirement={original_filenames.get('requirement', 'N/A')}")
+        
+        return customer_id, task_id, files, assignment, original_filenames
         
     except requests.exceptions.RequestException as e:
         log(f"⚠️ Claim task error: {e}")
-        return None, None, None, None
+        return None, None, None, None, None
 
-def save_files(customer_id_local, files):
-    """Save base64-encoded files to local folder named after customer_id_local."""
+def save_files(customer_id_local, files, original_filenames):
+    """Save base64-encoded files to local folder using original filenames."""
     folder = os.path.join(os.getcwd(), customer_id_local)
     os.makedirs(folder, exist_ok=True)
 
-    def decode_and_save(b64data, filename):
+    def decode_and_save(b64data, filename, original_filename=None):
         if not b64data:
             return None
+            
+        # Use original filename if provided, otherwise use default
+        if original_filename:
+            filename = original_filename
+            
         path = os.path.join(folder, filename)
         with open(path, "wb") as f:
             f.write(base64.b64decode(b64data))
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         return path
 
-    # Save code file (required)
+    # Save code file (required) - use original filename
+    code_filename = original_filenames.get('code', 'code_file.py')
     if files.get("code"):
-        decode_and_save(files["code"], "code_file.py")
+        decode_and_save(files["code"], "code_file.py", code_filename)
+        log(f"📄 Code file saved as: {code_filename}")
     else:
         raise ValueError("No code file provided in task")
 
-    # Save dataset file (optional)
-    if files.get("dataset"):
+    # Save dataset file (optional) - use original filename
+    dataset_filename = original_filenames.get('dataset')
+    if files.get("dataset") and dataset_filename:
+        decode_and_save(files["dataset"], "dataset_file.csv", dataset_filename)
+        log(f"📁 Dataset file saved as: {dataset_filename}")
+    elif files.get("dataset"):
         decode_and_save(files["dataset"], "dataset_file.csv")
-        log("📁 Dataset file saved")
+        log("📁 Dataset file saved (using default name)")
 
-    # Save requirements file (optional)
-    if files.get("requirement"):
+    # Save requirements file (optional) - use original filename
+    requirement_filename = original_filenames.get('requirement')
+    if files.get("requirement") and requirement_filename:
+        decode_and_save(files["requirement"], "requirements.txt", requirement_filename)
+        log(f"📋 Requirements file saved as: {requirement_filename}")
+    elif files.get("requirement"):
         decode_and_save(files["requirement"], "requirements.txt")
-        log("📋 Requirements file saved")
+        log("📋 Requirements file saved (using default name)")
 
     os.chmod(folder, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-    return folder
+    
+    # Return the actual filenames used for execution
+    execution_filenames = {
+        'code': code_filename,
+        'dataset': dataset_filename,
+        'requirement': requirement_filename or 'requirements.txt'
+    }
+    
+    return folder, execution_filenames
 
 # =====================================================
 #            FIRST-RUN SETUP: WORKER ID + PIP INSTALL
@@ -712,7 +742,7 @@ signal.signal(signal.SIGTERM, graceful_exit)
 # =====================================================
 
 def main_worker():
-    global current_folder, current_customer_id, current_task_id, current_usage_log, heartbeat_stop
+    global current_folder, current_customer_id, current_task_id, current_usage_log, heartbeat_stop, original_filenames
 
     while not shutdown_flag.is_set():
         if not check_server():
@@ -734,7 +764,7 @@ def main_worker():
             sleep(5)
             continue
 
-        customer_id_local, task_id, files, assignment = claim_task()
+        customer_id_local, task_id, files, assignment, original_filenames = claim_task()
         if not task_id:
             log("ℹ️ No task claimed. Retrying in 5s...")
             sleep(5)
@@ -745,7 +775,7 @@ def main_worker():
             log(f"📊 Assignment: Worker {assignment.get('workerIndex', 0) + 1} of {assignment.get('totalWorkers', 1)}")
         
         try:
-            folder = save_files(customer_id_local, files)
+            folder, execution_filenames = save_files(customer_id_local, files, original_filenames or {})
         except Exception as e:
             log(f"❌ Failed to save files: {e}")
             sleep(5)
@@ -778,7 +808,14 @@ def main_worker():
         try:
             decrypt_folder(folder)
             log("🔓 Files decrypted for execution.")
-            result = run_in_docker(folder, worker_id, customer_id_local)
+            
+            # Use the actual filenames for execution
+            code_filename = execution_filenames['code']
+            requirements_filename = execution_filenames['requirement']
+            
+            result = run_in_docker(folder, worker_id, customer_id_local, 
+                                 code_filename=code_filename, 
+                                 requirements_filename=requirements_filename)
             log(f"✅ Docker finished. Exit code: {result['exit_code']}")
             
             # Log output files info
@@ -801,6 +838,7 @@ def main_worker():
             current_customer_id = None
             current_task_id = None
             current_usage_log = []
+            original_filenames = {}
 
             log("🚿 Clearing Docker containers for next task...")
             clear_all_containers(full_cleanup=False)

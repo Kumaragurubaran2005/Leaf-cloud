@@ -570,7 +570,7 @@ app.get("/canceltask", (req, res) => {
 
 // -------------------- CUSTOMER ENDPOINTS --------------------
 
-// Submit package
+// Submit package - UPDATED TO STORE ORIGINAL FILENAMES
 app.post(
   "/sendingpackage",
   authenticateJWT,
@@ -588,6 +588,13 @@ app.post(
       const customerId = generateUniqueCustomerId();
       const taskId = generateUniqueTaskId();
 
+      // Store original filenames
+      const originalFilenames = {
+        code: files.code[0].originalname,
+        dataset: files.dataset ? files.dataset[0].originalname : null,
+        requirement: files.requirement ? files.requirement[0].originalname : null
+      };
+
       const datasetChunks = files.dataset
         ? splitDataset(files.dataset[0].buffer, numWorkers)
         : Array(numWorkers).fill(null);
@@ -599,6 +606,7 @@ app.post(
           datasetChunks,
           requirement: files.requirement ? files.requirement[0].buffer : null,
         },
+        originalFilenames, // Store original filenames
         numWorkers,
         workers: [],
         results: {},
@@ -621,11 +629,11 @@ app.post(
         taskQueue.push({ customerId, taskId });
       }
 
-      // Store in database (using your table structure)
+      // Store in database (using your table structure) - UPDATED TO STORE FILENAMES
       try {
         await runQuery(
-          `INSERT INTO files (customer_id, customername, code, dataset, requirement, num_workers)
-           VALUES (:customerId, :cusname, :code, :dataset, :requirement, :numWorkers)`,
+          `INSERT INTO files (customer_id, customername, code, dataset, requirement, num_workers, code_filename, dataset_filename, requirement_filename)
+           VALUES (:customerId, :cusname, :code, :dataset, :requirement, :numWorkers, :codeFilename, :datasetFilename, :requirementFilename)`,
           {
             customerId,
             cusname,
@@ -633,6 +641,9 @@ app.post(
             dataset: files.dataset ? files.dataset[0].buffer : null,
             requirement: files.requirement ? files.requirement[0].buffer : null,
             numWorkers,
+            codeFilename: originalFilenames.code,
+            datasetFilename: originalFilenames.dataset,
+            requirementFilename: originalFilenames.requirement
           },
           { autoCommit: true }
         );
@@ -644,12 +655,14 @@ app.post(
       addProgressUpdate(customerId, `📦 Task queued successfully. Waiting for ${numWorkers} worker(s) to process your job...`);
 
       console.log(`📦 New task from customer ${cusname} (${customerId}) with ${numWorkers} workers`);
+      console.log(`📁 Original filenames: Code=${originalFilenames.code}, Dataset=${originalFilenames.dataset}, Requirement=${originalFilenames.requirement}`);
       
       res.json({ 
         customerId, 
         message: "Task queued successfully",
         numWorkers,
-        taskId 
+        taskId,
+        originalFilenames // Return original filenames for confirmation
       });
     } catch (error) {
       console.error("Error in /sendingpackage:", error.message);
@@ -658,9 +671,9 @@ app.post(
   }
 );
 
-// -------------------- FILE DOWNLOAD ENDPOINTS (FIXED) --------------------
+// -------------------- FILE DOWNLOAD ENDPOINTS (UPDATED WITH ORIGINAL FILENAMES) --------------------
 
-// Get stored code file - FIXED CIRCULAR REFERENCE ISSUE
+// Get stored code file - UPDATED TO USE ORIGINAL FILENAME
 app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
@@ -668,7 +681,7 @@ app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
     console.log(`🔍 Fetching code file for customer: ${customerId}`);
     
     const result = await runQuery(
-      `SELECT code, customername FROM files WHERE customer_id = :customerId`,
+      `SELECT code, customername, code_filename FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
@@ -682,6 +695,7 @@ app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
 
     const codeData = result.rows[0].CODE;
     const customerName = result.rows[0].CUSTOMERNAME;
+    const originalFilename = result.rows[0].CODE_FILENAME || `code_${customerId}.py`;
 
     if (!codeData) {
       console.log(`❌ Code file is null for customer ${customerId}`);
@@ -702,11 +716,11 @@ app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
       });
     }
 
-    console.log(`✅ Sending code file for customer ${customerId}, size: ${codeBuffer.length} bytes`);
+    console.log(`✅ Sending code file for customer ${customerId}, original filename: ${originalFilename}, size: ${codeBuffer.length} bytes`);
 
-    // Set appropriate headers for download
+    // Set appropriate headers for download with original filename
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="code_${customerId}.py"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${originalFilename}"`);
     res.setHeader('Content-Length', codeBuffer.length);
     res.setHeader('Cache-Control', 'no-cache');
     
@@ -721,7 +735,7 @@ app.get("/files/code/:customerId", authenticateJWT, async (req, res) => {
   }
 });
 
-// Get stored dataset file - FIXED
+// Get stored dataset file - UPDATED TO USE ORIGINAL FILENAME
 app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
@@ -729,7 +743,7 @@ app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
     console.log(`🔍 Fetching dataset file for customer: ${customerId}`);
     
     const result = await runQuery(
-      `SELECT dataset, customername FROM files WHERE customer_id = :customerId`,
+      `SELECT dataset, customername, dataset_filename FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
@@ -742,6 +756,7 @@ app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
 
     const datasetData = result.rows[0].DATASET;
     const customerName = result.rows[0].CUSTOMERNAME;
+    const originalFilename = result.rows[0].DATASET_FILENAME || `dataset_${customerId}`;
 
     if (!datasetData) {
       return res.status(404).json({ 
@@ -760,10 +775,10 @@ app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
       });
     }
 
-    console.log(`✅ Sending dataset file for customer ${customerId}, size: ${datasetBuffer.length} bytes`);
+    console.log(`✅ Sending dataset file for customer ${customerId}, original filename: ${originalFilename}, size: ${datasetBuffer.length} bytes`);
 
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="dataset_${customerId}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${originalFilename}"`);
     res.setHeader('Content-Length', datasetBuffer.length);
     res.setHeader('Cache-Control', 'no-cache');
     
@@ -778,7 +793,7 @@ app.get("/files/dataset/:customerId", authenticateJWT, async (req, res) => {
   }
 });
 
-// Get stored requirement file - FIXED
+// Get stored requirement file - UPDATED TO USE ORIGINAL FILENAME
 app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
@@ -786,7 +801,7 @@ app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
     console.log(`🔍 Fetching requirement file for customer: ${customerId}`);
     
     const result = await runQuery(
-      `SELECT requirement, customername FROM files WHERE customer_id = :customerId`,
+      `SELECT requirement, customername, requirement_filename FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
@@ -799,6 +814,7 @@ app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
 
     const requirementData = result.rows[0].REQUIREMENT;
     const customerName = result.rows[0].CUSTOMERNAME;
+    const originalFilename = result.rows[0].REQUIREMENT_FILENAME || `requirements_${customerId}.txt`;
 
     if (!requirementData) {
       return res.status(404).json({ 
@@ -817,10 +833,10 @@ app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
       });
     }
 
-    console.log(`✅ Sending requirement file for customer ${customerId}, size: ${requirementBuffer.length} bytes`);
+    console.log(`✅ Sending requirement file for customer ${customerId}, original filename: ${originalFilename}, size: ${requirementBuffer.length} bytes`);
 
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="requirements_${customerId}.txt"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${originalFilename}"`);
     res.setHeader('Content-Length', requirementBuffer.length);
     res.setHeader('Cache-Control', 'no-cache');
     
@@ -835,13 +851,14 @@ app.get("/files/requirement/:customerId", authenticateJWT, async (req, res) => {
   }
 });
 
-// Get all file information for a customer
+// Get all file information for a customer - UPDATED WITH FILENAMES
 app.get("/files/info/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
   try {
     const result = await runQuery(
       `SELECT customer_id, customername, num_workers, 
+              code_filename, dataset_filename, requirement_filename,
               CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
               CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
               CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
@@ -863,16 +880,19 @@ app.get("/files/info/:customerId", authenticateJWT, async (req, res) => {
         code: {
           available: fileInfo.CODE_SIZE > 0,
           size: fileInfo.CODE_SIZE,
+          originalFilename: fileInfo.CODE_FILENAME || `code_${customerId}.py`,
           downloadUrl: `/files/code/${customerId}`
         },
         dataset: {
           available: fileInfo.DATASET_SIZE > 0,
           size: fileInfo.DATASET_SIZE,
+          originalFilename: fileInfo.DATASET_FILENAME || `dataset_${customerId}`,
           downloadUrl: `/files/dataset/${customerId}`
         },
         requirement: {
           available: fileInfo.REQUIREMENT_SIZE > 0,
           size: fileInfo.REQUIREMENT_SIZE,
+          originalFilename: fileInfo.REQUIREMENT_FILENAME || `requirements_${customerId}.txt`,
           downloadUrl: `/files/requirement/${customerId}`
         }
       }
@@ -885,13 +905,15 @@ app.get("/files/info/:customerId", authenticateJWT, async (req, res) => {
   }
 });
 
-// Get all customer files as ZIP
+// Get all customer files as ZIP - UPDATED TO USE ORIGINAL FILENAMES
 app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
   try {
     const result = await runQuery(
-      `SELECT customername, code, dataset, requirement FROM files WHERE customer_id = :customerId`,
+      `SELECT customername, code, dataset, requirement, 
+              code_filename, dataset_filename, requirement_filename 
+       FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
@@ -906,22 +928,25 @@ app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
     res.attachment(`files_${customerId}_${customerName}.zip`);
     archive.pipe(res);
 
-    // Add code file
+    // Add code file with original filename
     if (files.CODE) {
       const codeBuffer = await extractBlobData(files.CODE);
-      archive.append(codeBuffer, { name: `code.py` });
+      const codeFilename = files.CODE_FILENAME || `code.py`;
+      archive.append(codeBuffer, { name: codeFilename });
     }
 
-    // Add dataset file
+    // Add dataset file with original filename
     if (files.DATASET) {
       const datasetBuffer = await extractBlobData(files.DATASET);
-      archive.append(datasetBuffer, { name: `dataset` });
+      const datasetFilename = files.DATASET_FILENAME || `dataset`;
+      archive.append(datasetBuffer, { name: datasetFilename });
     }
 
-    // Add requirement file
+    // Add requirement file with original filename
     if (files.REQUIREMENT) {
       const requirementBuffer = await extractBlobData(files.REQUIREMENT);
-      archive.append(requirementBuffer, { name: `requirements.txt` });
+      const requirementFilename = files.REQUIREMENT_FILENAME || `requirements.txt`;
+      archive.append(requirementBuffer, { name: requirementFilename });
     }
 
     // Add info file
@@ -930,9 +955,9 @@ app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
       customerName,
       exportedAt: new Date().toISOString(),
       files: {
-        code: files.CODE ? `code.py (${files.CODE.length} bytes)` : 'Not available',
-        dataset: files.DATASET ? `dataset (${files.DATASET.length} bytes)` : 'Not available',
-        requirement: files.REQUIREMENT ? `requirements.txt (${files.REQUIREMENT.length} bytes)` : 'Not available'
+        code: files.CODE ? `${files.CODE_FILENAME || 'code.py'} (${files.CODE.length} bytes)` : 'Not available',
+        dataset: files.DATASET ? `${files.DATASET_FILENAME || 'dataset'} (${files.DATASET.length} bytes)` : 'Not available',
+        requirement: files.REQUIREMENT ? `${files.REQUIREMENT_FILENAME || 'requirements.txt'} (${files.REQUIREMENT.length} bytes)` : 'Not available'
       }
     };
     archive.append(JSON.stringify(info, null, 2), { name: `file_info.json` });
@@ -943,7 +968,7 @@ app.get("/files/all/:customerId", authenticateJWT, async (req, res) => {
     });
 
     archive.finalize();
-    console.log(`📦 Sent all files as ZIP for customer ${customerId}`);
+    console.log(`📦 Sent all files as ZIP for customer ${customerId} with original filenames`);
     
   } catch (err) {
     console.error("Error creating files ZIP:", err.message);
@@ -1196,7 +1221,7 @@ app.get("/askfortask", async (req, res) => {
   });
 });
 
-// Get a task
+// Get a task - UPDATED TO SEND ORIGINAL FILENAMES TO WORKERS
 app.post("/gettask", async (req, res) => {
   const { workerId } = req.body;
   if (!workerId) return res.status(400).json({ message: "workerId required" });
@@ -1267,6 +1292,7 @@ app.post("/gettask", async (req, res) => {
       dataset: datasetChunk ? datasetChunk.toString("base64") : null,
       requirement: customerTask.files.requirement?.toString("base64") || null,
     },
+    originalFilenames: customerTask.originalFilenames, // Send original filenames to worker
     assignment: {
       workerIndex,
       totalWorkers: customerTask.numWorkers,
@@ -1746,6 +1772,9 @@ app.get("/clients/summary", authenticateJWT, async (req, res) => {
         customer_id,
         customername,
         num_workers,
+        code_filename,
+        dataset_filename,
+        requirement_filename,
         CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
         CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
         CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
@@ -1761,6 +1790,11 @@ app.get("/clients/summary", authenticateJWT, async (req, res) => {
         code: row.CODE_SIZE > 0,
         dataset: row.DATASET_SIZE > 0,
         requirement: row.REQUIREMENT_SIZE > 0
+      },
+      originalFilenames: {
+        code: row.CODE_FILENAME,
+        dataset: row.DATASET_FILENAME,
+        requirement: row.REQUIREMENT_FILENAME
       },
       totalSize: row.CODE_SIZE + row.DATASET_SIZE + row.REQUIREMENT_SIZE,
       documentsUrl: `/client/documents/${row.CUSTOMER_ID}`,
@@ -1783,7 +1817,7 @@ app.get("/clients/summary", authenticateJWT, async (req, res) => {
   }
 });
 
-// Get client documents with enhanced information
+// Get client documents with enhanced information - UPDATED WITH FILENAMES
 app.get("/client/documents/:customerId", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
@@ -1792,6 +1826,7 @@ app.get("/client/documents/:customerId", authenticateJWT, async (req, res) => {
     const filesResult = await runQuery(
       `SELECT customer_id, customername, num_workers, 
               code, dataset, requirement,
+              code_filename, dataset_filename, requirement_filename,
               CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
               CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
               CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
@@ -1899,20 +1934,20 @@ app.get("/client/documents/:customerId", authenticateJWT, async (req, res) => {
           code: {
             available: fileInfo.CODE_SIZE > 0,
             size: fileInfo.CODE_SIZE,
+            originalFilename: fileInfo.CODE_FILENAME || `code_${customerId}.py`,
             downloadUrl: `/files/code/${customerId}`,
-            filename: `code_${customerId}.py`
           },
           dataset: {
             available: fileInfo.DATASET_SIZE > 0,
             size: fileInfo.DATASET_SIZE,
+            originalFilename: fileInfo.DATASET_FILENAME || `dataset_${customerId}`,
             downloadUrl: `/files/dataset/${customerId}`,
-            filename: `dataset_${customerId}`
           },
           requirement: {
             available: fileInfo.REQUIREMENT_SIZE > 0,
             size: fileInfo.REQUIREMENT_SIZE,
+            originalFilename: fileInfo.REQUIREMENT_FILENAME || `requirements_${customerId}.txt`,
             downloadUrl: `/files/requirement/${customerId}`,
-            filename: `requirements_${customerId}.txt`
           }
         },
         // Usage statistics
@@ -2011,14 +2046,16 @@ function formatFileSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-// Enhanced download all documents endpoint
+// Enhanced download all documents endpoint - UPDATED TO USE ORIGINAL FILENAMES
 app.get("/client/documents/:customerId/download/all", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
   try {
     // Get files from database
     const filesResult = await runQuery(
-      `SELECT customername, code, dataset, requirement FROM files WHERE customer_id = :customerId`,
+      `SELECT customername, code, dataset, requirement, 
+              code_filename, dataset_filename, requirement_filename 
+       FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
@@ -2033,20 +2070,21 @@ app.get("/client/documents/:customerId/download/all", authenticateJWT, async (re
     res.attachment(`client_documents_${customerId}_${customerName}.zip`);
     archive.pipe(res);
 
-    // Add input files with proper extensions
+    // Add input files with original filenames
     if (files.CODE) {
       const codeBuffer = await extractBlobData(files.CODE);
-      archive.append(codeBuffer, { name: `input_files/code.py` });
+      const codeFilename = files.CODE_FILENAME || `code.py`;
+      archive.append(codeBuffer, { name: `input_files/${codeFilename}` });
     }
     if (files.DATASET) {
       const datasetBuffer = await extractBlobData(files.DATASET);
-      // Try to determine dataset file extension
-      const datasetExtension = await getFileExtension(datasetBuffer);
-      archive.append(datasetBuffer, { name: `input_files/dataset${datasetExtension}` });
+      const datasetFilename = files.DATASET_FILENAME || `dataset`;
+      archive.append(datasetBuffer, { name: `input_files/${datasetFilename}` });
     }
     if (files.REQUIREMENT) {
       const requirementBuffer = await extractBlobData(files.REQUIREMENT);
-      archive.append(requirementBuffer, { name: `input_files/requirements.txt` });
+      const requirementFilename = files.REQUIREMENT_FILENAME || `requirements.txt`;
+      archive.append(requirementBuffer, { name: `input_files/${requirementFilename}` });
     }
 
     // Get enhanced usage data
@@ -2163,9 +2201,9 @@ app.get("/client/documents/:customerId/download/all", authenticateJWT, async (re
       customerName,
       exportedAt: new Date().toISOString(),
       totalFiles: [
-        files.CODE ? 'input_files/code.py' : null,
-        files.DATASET ? 'input_files/dataset' : null,
-        files.REQUIREMENT ? 'input_files/requirements.txt' : null,
+        files.CODE ? `input_files/${files.CODE_FILENAME || 'code.py'}` : null,
+        files.DATASET ? `input_files/${files.DATASET_FILENAME || 'dataset'}` : null,
+        files.REQUIREMENT ? `input_files/${files.REQUIREMENT_FILENAME || 'requirements.txt'}` : null,
         'reports/usage_statistics_detailed.csv',
         'reports/usage_statistics_summary.csv',
         'reports/usage_summary.json',
@@ -2176,6 +2214,11 @@ app.get("/client/documents/:customerId/download/all", authenticateJWT, async (re
         code: codeSize,
         dataset: datasetSize,
         requirement: requirementSize
+      },
+      originalFilenames: {
+        code: files.CODE_FILENAME,
+        dataset: files.DATASET_FILENAME,
+        requirement: files.REQUIREMENT_FILENAME
       }
     };
     archive.append(JSON.stringify(manifest, null, 2), { name: `manifest.json` });
@@ -2198,9 +2241,9 @@ reports/         - Detailed usage statistics and performance reports
 Files Included:
 --------------
 INPUT FILES:
-1. code.py                    - Main code file
-2. dataset                    - Dataset file (if provided)
-3. requirements.txt           - Requirements file (if provided)
+1. ${files.CODE_FILENAME || 'code.py'}                    - Main code file
+2. ${files.DATASET_FILENAME || 'dataset'}                    - Dataset file (if provided)
+3. ${files.REQUIREMENT_FILENAME || 'requirements.txt'}           - Requirements file (if provided)
 
 USAGE REPORTS:
 4. usage_statistics_detailed.csv - Detailed usage data with timestamps
@@ -2238,7 +2281,7 @@ Total Size: ${formatFileSize(Object.values(manifest.fileSizes).reduce((a, b) => 
     });
 
     archive.on('end', () => {
-      console.log(`📦 Sent enhanced documents archive for client ${customerId}`);
+      console.log(`📦 Sent enhanced documents archive for client ${customerId} with original filenames`);
     });
 
     archive.finalize();
@@ -2312,6 +2355,9 @@ app.get("/clients/search", authenticateJWT, async (req, res) => {
         customer_id,
         customername,
         num_workers,
+        code_filename,
+        dataset_filename,
+        requirement_filename,
         CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
         CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
         CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
@@ -2330,6 +2376,11 @@ app.get("/clients/search", authenticateJWT, async (req, res) => {
         code: row.CODE_SIZE > 0,
         dataset: row.DATASET_SIZE > 0,
         requirement: row.REQUIREMENT_SIZE > 0
+      },
+      originalFilenames: {
+        code: row.CODE_FILENAME,
+        dataset: row.DATASET_FILENAME,
+        requirement: row.REQUIREMENT_FILENAME
       },
       totalSize: row.CODE_SIZE + row.DATASET_SIZE + row.REQUIREMENT_SIZE,
       documentsUrl: `/client/documents/${row.CUSTOMER_ID}`,
@@ -2360,6 +2411,9 @@ app.get("/admin/clients", authenticateJWT, async (req, res) => {
         customer_id,
         customername,
         num_workers,
+        code_filename,
+        dataset_filename,
+        requirement_filename,
         CASE WHEN code IS NOT NULL THEN dbms_lob.getlength(code) ELSE 0 END as code_size,
         CASE WHEN dataset IS NOT NULL THEN dbms_lob.getlength(dataset) ELSE 0 END as dataset_size,
         CASE WHEN requirement IS NOT NULL THEN dbms_lob.getlength(requirement) ELSE 0 END as requirement_size
@@ -2375,6 +2429,11 @@ app.get("/admin/clients", authenticateJWT, async (req, res) => {
         code: row.CODE_SIZE > 0,
         dataset: row.DATASET_SIZE > 0,
         requirement: row.REQUIREMENT_SIZE > 0
+      },
+      originalFilenames: {
+        code: row.CODE_FILENAME,
+        dataset: row.DATASET_FILENAME,
+        requirement: row.REQUIREMENT_FILENAME
       },
       totalSize: row.CODE_SIZE + row.DATASET_SIZE + row.REQUIREMENT_SIZE,
       documentsUrl: `/client/documents/${row.CUSTOMER_ID}`,
@@ -2397,13 +2456,15 @@ app.get("/admin/clients", authenticateJWT, async (req, res) => {
   }
 });
 
-// Download only input files
+// Download only input files - UPDATED TO USE ORIGINAL FILENAMES
 app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async (req, res) => {
   const { customerId } = req.params;
   
   try {
     const filesResult = await runQuery(
-      `SELECT customername, code, dataset, requirement FROM files WHERE customer_id = :customerId`,
+      `SELECT customername, code, dataset, requirement, 
+              code_filename, dataset_filename, requirement_filename 
+       FROM files WHERE customer_id = :customerId`,
       { customerId }
     );
 
@@ -2420,15 +2481,18 @@ app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async 
 
     if (files.CODE) {
       const codeBuffer = await extractBlobData(files.CODE);
-      archive.append(codeBuffer, { name: `code.py` });
+      const codeFilename = files.CODE_FILENAME || `code.py`;
+      archive.append(codeBuffer, { name: codeFilename });
     }
     if (files.DATASET) {
       const datasetBuffer = await extractBlobData(files.DATASET);
-      archive.append(datasetBuffer, { name: `dataset` });
+      const datasetFilename = files.DATASET_FILENAME || `dataset`;
+      archive.append(datasetBuffer, { name: datasetFilename });
     }
     if (files.REQUIREMENT) {
       const requirementBuffer = await extractBlobData(files.REQUIREMENT);
-      archive.append(requirementBuffer, { name: `requirements.txt` });
+      const requirementFilename = files.REQUIREMENT_FILENAME || `requirements.txt`;
+      archive.append(requirementBuffer, { name: requirementFilename });
     }
 
     // Add file info
@@ -2437,9 +2501,9 @@ app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async 
       customerName,
       exportedAt: new Date().toISOString(),
       files: {
-        code: files.CODE ? `code.py (${(await extractBlobData(files.CODE)).length} bytes)` : 'Not available',
-        dataset: files.DATASET ? `dataset (${(await extractBlobData(files.DATASET)).length} bytes)` : 'Not available',
-        requirement: files.REQUIREMENT ? `requirements.txt (${(await extractBlobData(files.REQUIREMENT)).length} bytes)` : 'Not available'
+        code: files.CODE ? `${files.CODE_FILENAME || 'code.py'} (${(await extractBlobData(files.CODE)).length} bytes)` : 'Not available',
+        dataset: files.DATASET ? `${files.DATASET_FILENAME || 'dataset'} (${(await extractBlobData(files.DATASET)).length} bytes)` : 'Not available',
+        requirement: files.REQUIREMENT ? `${files.REQUIREMENT_FILENAME || 'requirements.txt'} (${(await extractBlobData(files.REQUIREMENT)).length} bytes)` : 'Not available'
       }
     };
     archive.append(JSON.stringify(fileInfo, null, 2), { name: `file_info.json` });
@@ -2450,7 +2514,7 @@ app.get("/client/documents/:customerId/download/inputs", authenticateJWT, async 
     });
 
     archive.finalize();
-    console.log(`📦 Sent input files archive for client ${customerId}`);
+    console.log(`📦 Sent input files archive for client ${customerId} with original filenames`);
     
   } catch (err) {
     console.error("Error creating input files archive:", err.message);
@@ -2700,6 +2764,7 @@ app.listen(PORT, () => {
   console.log(`📋 Enhanced client documents endpoints: ACTIVE`);
   console.log(`🔍 Client search functionality: ACTIVE`);
   console.log(`📊 Client statistics: ACTIVE`);
+  console.log(`📝 Original filename preservation: ENABLED`);
 });
 
 export default app;
