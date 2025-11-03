@@ -3,7 +3,7 @@ create table files (customer_id VARCHAR(30) NOT NULL,customername varchar2(20) N
 
 select * from files ;
 
-drop table users;
+drop table files;
 
 
 
@@ -36,3 +36,17 @@ CREATE TABLE worker_usage_stats (
 CREATE INDEX idx_worker_usage_worker_id ON worker_usage_stats(worker_id);
 CREATE INDEX idx_worker_usage_timestamp ON worker_usage_stats(timestamp);
 CREATE INDEX idx_worker_usage_task_id ON worker_usage_stats(task_id);
+
+
+CREATE TABLE files (
+    customer_id      VARCHAR2(100) PRIMARY KEY,
+    customername     VARCHAR2(100),
+    code             BLOB,
+    dataset          BLOB,
+    requirement      BLOB,
+    num_workers      NUMBER,
+    code_filename    VARCHAR2(255),        -- NEW: Stores original code filename
+    dataset_filename VARCHAR2(255),        -- NEW: Stores original dataset filename  
+    requirement_filename VARCHAR2(255),    -- NEW: Stores original requirement filename
+    created_date     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

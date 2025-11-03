@@ -309,7 +309,7 @@ const FileUploadForm: React.FC<{
     }
   };
 
-  const getFileInfo = (file: File | null, type: FileType): string => {
+  const getFileInfo = (file: File | null, _type: FileType): string => {
     if (!file) return '';
     return `${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`;
   };
