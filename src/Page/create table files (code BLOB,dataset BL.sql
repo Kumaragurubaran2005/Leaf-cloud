@@ -1,7 +1,7 @@
 create table files (customer_id VARCHAR(30) NOT NULL,customername varchar2(20) NOT NULL,code BLOB NOT NULL,dataset BLOB,requirement BLOB,num_workers NUMBER NOT NULL);
  
 
-select * from users where username='Kumar' and PASSWORD='2005';
+select * from files ;
 
 drop table users;
 

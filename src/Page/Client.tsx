@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+
 interface Update {
   update: string;
   timestamp?: string;
@@ -66,21 +67,21 @@ const useFileValidation = () => {
     
     switch (type) {
       case 'code':
-        const codeExtensions = ['.js', '.py', '.txt', '.zip', '.java', '.cpp', '.c', '.html', '.css', '.php'];
+        const codeExtensions = ['.js', '.py', '.txt', '.zip', '.java', '.cpp', '.c', '.html', '.css', '.php', '.rb', '.go', '.rs', '.ts', '.jsx', '.tsx'];
         if (!codeExtensions.includes(fileExtension)) {
           return { isValid: false, error: `Invalid file type for code. Allowed: ${codeExtensions.join(', ')}` };
         }
         break;
         
       case 'dataset':
-        const datasetExtensions = ['.csv', '.json', '.zip', '.xlsx', '.xls', '.tsv'];
+        const datasetExtensions = ['.csv', '.json', '.zip', '.xlsx', '.xls', '.tsv', '.parquet', '.feather'];
         if (!datasetExtensions.includes(fileExtension)) {
           return { isValid: false, error: `Invalid file type for dataset. Allowed: ${datasetExtensions.join(', ')}` };
         }
         break;
         
       case 'requirement':
-        const requirementExtensions = ['.txt', '.pdf', '.doc', '.docx', '.md'];
+        const requirementExtensions = ['.txt', '.pdf', '.doc', '.docx', '.md', '.rtf'];
         if (!requirementExtensions.includes(fileExtension)) {
           return { isValid: false, error: `Invalid file type for requirements. Allowed: ${requirementExtensions.join(', ')}` };
         }
@@ -115,11 +116,30 @@ const createFormData = (
   responseNumber: string
 ): FormData => {
   const formData = new FormData();
-  if (code) formData.append("code", code);
-  if (dataset) formData.append("dataset", dataset);
-  if (requirement) formData.append("requirement", requirement);
+  
+  // Append files with their original names explicitly
+  if (code) {
+    formData.append("code", code, code.name);
+    console.log('Adding code file:', code.name);
+  }
+  if (dataset) {
+    formData.append("dataset", dataset, dataset.name);
+    console.log('Adding dataset file:', dataset.name);
+  }
+  if (requirement) {
+    formData.append("requirement", requirement, requirement.name);
+    console.log('Adding requirement file:', requirement.name);
+  }
+  
   formData.append("customername", customerName);
   formData.append("respn", responseNumber);
+  
+  // Log form data contents for debugging
+  console.log('FormData contents:');
+  for (const pair of formData.entries()) {
+    console.log(`${pair[0]}:`, pair[1] instanceof File ? `${pair[1].name} (File)` : pair[1]);
+  }
+  
   return formData;
 };
 
@@ -159,7 +179,9 @@ class ApiService {
       throw new Error(errorText || `Upload failed: ${resp.status}`);
     }
     
-    return resp.json();
+    const result = await resp.json();
+    console.log('Upload response:', result);
+    return result;
   }
 
   async getUpdates(customerId: string): Promise<{ updates: Update[], hasUpdates: boolean, isCompleted?: boolean, progress?: any }> {
@@ -238,16 +260,24 @@ const FileUploadForm: React.FC<{
   onResponseNumberChange: (value: string) => void;
   onValidateFile: (file: File, type: FileType) => FileValidationResult;
 }> = ({ code, dataset, requirement, responseNumber, onFileChange, onResponseNumberChange, onValidateFile }) => {
+  const [fileErrors, setFileErrors] = useState<{[key in FileType]?: string}>({});
+
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>, type: FileType) => {
     const file = event.target.files?.[0] || null;
+    
+    // Clear previous error
+    setFileErrors(prev => ({...prev, [type]: undefined}));
     
     if (file) {
       const validation = onValidateFile(file, type);
       if (!validation.isValid) {
-        alert(validation.error);
+        setFileErrors(prev => ({...prev, [type]: validation.error}));
         event.target.value = '';
         return;
       }
+      
+      // Log file info for debugging
+      console.log(`Selected ${type} file:`, file.name, `Size: ${(file.size / 1024 / 1024).toFixed(2)}MB`);
     }
     
     onFileChange(file, type);
@@ -256,11 +286,11 @@ const FileUploadForm: React.FC<{
   const getAcceptString = (type: FileType): string => {
     switch (type) {
       case 'code':
-        return '.js,.py,.txt,.zip,.java,.cpp,.c,.html,.css,.php';
+        return '.js,.py,.txt,.zip,.java,.cpp,.c,.html,.css,.php,.rb,.go,.rs,.ts,.jsx,.tsx';
       case 'dataset':
-        return '.csv,.json,.zip,.xlsx,.xls,.tsv';
+        return '.csv,.json,.zip,.xlsx,.xls,.tsv,.parquet,.feather';
       case 'requirement':
-        return '.txt,.pdf,.doc,.docx,.md';
+        return '.txt,.pdf,.doc,.docx,.md,.rtf';
       default:
         return '';
     }
@@ -269,7 +299,7 @@ const FileUploadForm: React.FC<{
   const getLabel = (type: FileType): string => {
     switch (type) {
       case 'code':
-        return 'Code File';
+        return 'Code File *';
       case 'dataset':
         return 'Dataset (Optional)';
       case 'requirement':
@@ -279,34 +309,61 @@ const FileUploadForm: React.FC<{
     }
   };
 
+  const getFileInfo = (file: File | null, type: FileType): string => {
+    if (!file) return '';
+    return `${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`;
+  };
+
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       {(['code', 'dataset', 'requirement'] as FileType[]).map((type) => (
-        <div key={type} className="space-y-2">
-          <label className="font-medium text-gray-700">{getLabel(type)}</label>
-          <input
-            type="file"
-            accept={getAcceptString(type)}
-            onChange={(e) => handleFileChange(e, type)}
-            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-300 focus:border-blue-500 transition-colors"
-          />
-          {type === 'code' && !code && (
-            <p className="text-sm text-red-500">Code file is required</p>
-          )}
+        <div key={type} className="space-y-3">
+          <label className="font-medium text-gray-700 block">
+            {getLabel(type)}
+            {type === 'code' && <span className="text-red-500 ml-1">*</span>}
+          </label>
+          
+          <div className="flex items-center gap-3">
+            <input
+              type="file"
+              accept={getAcceptString(type)}
+              onChange={(e) => handleFileChange(e, type)}
+              className="flex-1 p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-300 focus:border-blue-500 transition-colors file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+            />
+          </div>
+          
+          {/* File info and errors */}
+          <div className="min-h-6">
+            {fileErrors[type] && (
+              <p className="text-sm text-red-500 font-medium">{fileErrors[type]}</p>
+            )}
+            {!fileErrors[type] && (type === 'code' ? code : type === 'dataset' ? dataset : requirement) && (
+              <p className="text-sm text-green-600 font-medium">
+                ✅ {getFileInfo(type === 'code' ? code : type === 'dataset' ? dataset : requirement, type)}
+              </p>
+            )}
+            {type === 'code' && !code && !fileErrors.code && (
+              <p className="text-sm text-red-500">Code file is required</p>
+            )}
+          </div>
         </div>
       ))}
 
       <div className="space-y-2">
-        <label className="font-medium text-gray-700">No. of Responders</label>
+        <label className="font-medium text-gray-700">
+          No. of Responders *
+          <span className="text-red-500 ml-1">*</span>
+        </label>
         <input
           type="number"
           min={1}
           max={10}
           value={responseNumber}
-          onChange={(e) => onResponseNumberChange(e.target.value.replace(/\D/g, ""))}
+          onChange={(e) => onResponseNumberChange(e.target.value.replace(/\D/g, "").slice(0, 2))}
           className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-300 focus:border-blue-500 transition-colors"
-          placeholder="Enter number of responders"
+          placeholder="Enter number of responders (1-10)"
         />
+        <p className="text-sm text-gray-500">Number of parallel workers to process your job</p>
       </div>
     </div>
   );
@@ -319,6 +376,7 @@ const ControlButtons: React.FC<{
   isCancelled: boolean;
   hasCustomerId: boolean;
   serverLive: boolean;
+  canSubmit: boolean;
   onSendFiles: () => void;
   onCancel: () => void;
   onDownload: () => void;
@@ -329,6 +387,7 @@ const ControlButtons: React.FC<{
   isCancelled,
   hasCustomerId,
   serverLive,
+  canSubmit,
   onSendFiles,
   onCancel,
   onDownload,
@@ -338,28 +397,45 @@ const ControlButtons: React.FC<{
       <button
         type="button"
         onClick={onSendFiles}
-        disabled={!serverLive || isUploading}
-        className="px-6 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium shadow-md"
+        disabled={!serverLive || isUploading || !canSubmit}
+        className="px-6 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 disabled:bg-gray-400 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium shadow-md flex items-center gap-2"
       >
-        {isUploading ? "Uploading..." : "Send Files"}
+        {isUploading ? (
+          <>
+            <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+            Uploading...
+          </>
+        ) : (
+          'Send Files'
+        )}
       </button>
 
       <button
         type="button"
         onClick={onCancel}
         disabled={!hasCustomerId || isCompleted || isUploading || isCancelling || isCancelled}
-        className="px-6 py-3 bg-red-600 text-white rounded-xl hover:bg-red-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium shadow-md"
+        className="px-6 py-3 bg-red-600 text-white rounded-xl hover:bg-red-700 disabled:bg-gray-400 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium shadow-md flex items-center gap-2"
       >
-        {isCancelling ? "Cancelling..." : "Cancel"}
+        {isCancelling ? (
+          <>
+            <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+            Cancelling...
+          </>
+        ) : (
+          'Cancel Job'
+        )}
       </button>
 
       <button
         type="button"
         onClick={onDownload}
         disabled={!isCompleted || isCancelled}
-        className="px-6 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium shadow-md"
+        className="px-6 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:bg-gray-400 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium shadow-md flex items-center gap-2"
       >
-        Download All Results (ZIP)
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+        </svg>
+        Download Results (ZIP)
       </button>
     </div>
   );
@@ -375,7 +451,7 @@ const UpdatesList: React.FC<{
         <h3 className="font-semibold text-lg text-gray-800">Job Updates:</h3>
         {currentProgress && (
           <div className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium">
-            Progress: {currentProgress.submitted}/{currentProgress.total} ({currentProgress.percentage}%)
+            Progress: {currentProgress.submitted}/{currentProgress.total} ({currentProgress.centage}%)
           </div>
         )}
       </div>
@@ -388,11 +464,13 @@ const UpdatesList: React.FC<{
             {[...updates].reverse().map((update, idx) => (
               <li 
                 key={`${update.timestamp}-${idx}`} 
-                className={`p-4 rounded-xl shadow-sm border transition-shadow ${
+                className={`p-4 rounded-xl shadow-sm border transition-all duration-300 ${
                   update.isCompletion 
                     ? 'bg-green-50 border-green-200 hover:shadow-md' 
                     : update.status === 'cancelled'
                     ? 'bg-red-50 border-red-200 hover:shadow-md'
+                    : update.status === 'error'
+                    ? 'bg-orange-50 border-orange-200 hover:shadow-md'
                     : 'bg-white border-gray-200 hover:shadow-md'
                 }`}
               >
@@ -403,10 +481,17 @@ const UpdatesList: React.FC<{
                   {update.status === 'cancelled' && (
                     <div className="text-red-500 text-xl mt-1">❌</div>
                   )}
+                  {update.status === 'error' && (
+                    <div className="text-orange-500 text-xl mt-1">⚠️</div>
+                  )}
+                  {!update.isCompletion && !update.status && (
+                    <div className="text-blue-500 text-xl mt-1">ℹ️</div>
+                  )}
                   <div className="flex-1">
                     <p className={`font-medium ${
                       update.isCompletion ? 'text-green-800' : 
                       update.status === 'cancelled' ? 'text-red-800' : 
+                      update.status === 'error' ? 'text-orange-800' : 
                       'text-gray-700'
                     }`}>
                       {update.update}
@@ -454,9 +539,16 @@ const ServerStatus: React.FC<{
       <button
         onClick={onCheckServer}
         disabled={isCheckingServer}
-        className="px-5 py-2 bg-blue-600 text-white rounded-xl shadow hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+        className="px-5 py-2 bg-blue-600 text-white rounded-xl shadow hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium flex items-center gap-2"
       >
-        {isCheckingServer ? "Checking..." : "Check Server"}
+        {isCheckingServer ? (
+          <>
+            <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+            Checking...
+          </>
+        ) : (
+          'Check Server'
+        )}
       </button>
       <div className="flex items-center gap-3">
         <div className={`w-3 h-3 rounded-full ${serverLive ? 'bg-green-500' : 'bg-red-500'} animate-pulse`}></div>
@@ -489,6 +581,7 @@ const ClientPage = () => {
   const [isCancelled, setIsCancelled] = useState(false);
   const [currentProgress, setCurrentProgress] = useState<{ submitted: number; total: number; percentage: number } | null>(null);
   const navigate = useNavigate();
+  
   // Hooks
   const { elapsedSeconds, reset: resetTimer } = useTimer(!!customerId && !isCompleted && !isCancelled);
   const { validateFile } = useFileValidation();
@@ -500,6 +593,9 @@ const ClientPage = () => {
   const baseurl = getBaseUrl();
   const token = localStorage.getItem("authToken") || "";
   const apiService = new ApiService(baseurl, token);
+
+  // Check if form can be submitted
+  const canSubmit = !!code && !!responseNumber && parseInt(responseNumber) > 0;
 
   // Initialize customer name
   useEffect(() => {
@@ -527,7 +623,7 @@ const ClientPage = () => {
     checkServerAvailability();
   }, []);
 
-  // Fetch updates from server - ENHANCED
+  // Fetch updates from server
   const fetchUpdates = useCallback(async () => {
     if (!serverLive || !customerId) return;
 
@@ -635,6 +731,7 @@ const ClientPage = () => {
     
     if (!token) {
       alert("You must login first.");
+      navigate('/login');
       return;
     }
 
@@ -643,7 +740,19 @@ const ClientPage = () => {
       return;
     }
 
-    const files = createFormData(code, dataset, requirement, customerName, responseNumber);
+    if (!responseNumber || parseInt(responseNumber) < 1) {
+      alert("Please enter a valid number of responders.");
+      return;
+    }
+
+    console.log('Starting file upload with files:');
+    console.log('Code:', code?.name);
+    console.log('Dataset:', dataset?.name);
+    console.log('Requirement:', requirement?.name);
+    console.log('Customer:', customerName);
+    console.log('Responders:', responseNumber);
+
+    const formData = createFormData(code, dataset, requirement, customerName, responseNumber);
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${baseurl}/sendingpackage`);
@@ -660,7 +769,9 @@ const ClientPage = () => {
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
-        setUploadProgress(Math.round((e.loaded / e.total) * 100));
+        const progress = Math.round((e.loaded / e.total) * 100);
+        setUploadProgress(progress);
+        console.log(`Upload progress: ${progress}%`);
       }
     };
 
@@ -671,9 +782,17 @@ const ClientPage = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           const respData = JSON.parse(xhr.responseText);
+          console.log('Upload successful:', respData);
+          
           if (respData.customerId) {
             setCustomerId(respData.customerId);
+            setUpdates(prev => [...prev, {
+              update: `✅ Files uploaded successfully! Job ID: ${respData.customerId}`,
+              timestamp: new Date().toISOString(),
+              status: 'completed'
+            }]);
           }
+          
           alert("Files sent successfully! The job is now processing.");
           
           // Clear form
@@ -681,24 +800,33 @@ const ClientPage = () => {
           setDataset(null);
           setRequirement(null);
           setResponseNumber("1");
+          
+          // Reset file inputs
+          document.querySelectorAll('input[type="file"]').forEach(input => {
+            (input as HTMLInputElement).value = '';
+          });
+          
         } catch (err) {
           console.error("Parse error:", err);
           setError("Failed to parse server response");
+          alert("Upload failed: Invalid server response");
         }
       } else {
-        setError(`Upload failed: ${xhr.status}`);
-        alert(`Upload failed: ${xhr.status}`);
+        const errorMsg = `Upload failed: ${xhr.status} ${xhr.statusText}`;
+        setError(errorMsg);
+        alert(errorMsg);
       }
     };
 
     xhr.onerror = () => {
       setIsUploading(false);
       setUploadProgress(0);
-      setError("Upload failed due to network error");
-      alert("Upload failed due to network error");
+      const errorMsg = "Upload failed due to network error";
+      setError(errorMsg);
+      alert(errorMsg);
     };
 
-    xhr.send(files);
+    xhr.send(formData);
   };
 
   // Cancel handler
@@ -715,10 +843,11 @@ const ClientPage = () => {
 
     if (!token) {
       alert("You must login first.");
+      navigate('/login');
       return;
     }
 
-    if (!confirm("Are you sure you want to cancel this job?")) return;
+    if (!confirm("Are you sure you want to cancel this job? This action cannot be undone.")) return;
 
     setIsCancelling(true);
     setError(null);
@@ -734,7 +863,7 @@ const ClientPage = () => {
         pollingRef.current = null;
       }
 
-      // Update updates list - FIXED: Now uses proper Update type
+      // Update updates list
       setUpdates((prev) => [
         ...prev,
         { 
@@ -767,20 +896,42 @@ const ClientPage = () => {
       return;
     }
     
+    if (!isCompleted) {
+      alert("Job is not completed yet. Please wait for processing to finish.");
+      return;
+    }
+    
     try {
+      setUpdates(prev => [...prev, {
+        update: "📥 Starting download...",
+        timestamp: new Date().toISOString()
+      }]);
+      
       const blob = await apiService.downloadResults(customerId);
+      const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
-      link.href = URL.createObjectURL(blob);
-      link.download = `results_${customerId}.zip`;
+      link.href = url;
+      link.download = `results_${customerId}_${new Date().getTime()}.zip`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      URL.revokeObjectURL(link.href);
+      URL.revokeObjectURL(url);
+      
+      setUpdates(prev => [...prev, {
+        update: "✅ Download completed successfully!",
+        timestamp: new Date().toISOString()
+      }]);
     } catch (err) {
       console.error("Download failed:", err);
       const errorMessage = err instanceof Error ? err.message : "Download failed";
       setError(errorMessage);
       alert(`Failed to download ZIP: ${errorMessage}`);
+      
+      setUpdates(prev => [...prev, {
+        update: `❌ Download failed: ${errorMessage}`,
+        timestamp: new Date().toISOString(),
+        status: 'error'
+      }]);
     }
   };
 
@@ -800,22 +951,42 @@ const ClientPage = () => {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-8">
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 py-8 px-4">
       <div className="w-full max-w-4xl p-8 bg-white rounded-3xl shadow-2xl border border-gray-200/30">
       
-        <button
-          onClick={() => navigate('/client-documents')}
-          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition"
-        >
-          View All Documents
-        </button>
-        <h2 className="text-3xl font-bold text-center mb-2 text-gray-800">Send Package</h2>
-        <p className="text-center text-gray-600 mb-8">Upload your code and data for processing</p>
+        {/* Header with navigation */}
+        <div className="flex justify-between items-center mb-8">
+          <button
+            onClick={() => navigate('/client-documents')}
+            className="px-5 py-2.5 bg-gray-600 text-white rounded-xl hover:bg-gray-700 transition font-medium shadow-md flex items-center gap-2"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            View All Documents
+          </button>
+          
+          <button
+            onClick={() => navigate('/dashboard')}
+            className="px-5 py-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md"
+          >
+            Back to Dashboard
+          </button>
+        </div>
+
+        <h2 className="text-4xl font-bold text-center mb-3 text-gray-800">Send Package</h2>
+        <p className="text-center text-gray-600 mb-8 text-lg">Upload your code and data for processing</p>
 
         {/* Error Display */}
         {error && (
-          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl">
-            <p className="text-red-700 font-medium">Error: {error}</p>
+          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl animate-pulse">
+            <div className="flex items-center gap-3">
+              <div className="text-red-500 text-xl">⚠️</div>
+              <div>
+                <p className="text-red-700 font-medium">Error: {error}</p>
+                <p className="text-red-600 text-sm mt-1">Please check your connection and try again.</p>
+              </div>
+            </div>
           </div>
         )}
 
@@ -872,37 +1043,41 @@ const ClientPage = () => {
 
           {/* Upload Progress */}
           {uploadProgress > 0 && (
-            <div className="w-full bg-gray-200 h-3 rounded-xl overflow-hidden">
+            <div className="w-full bg-gray-200 rounded-xl overflow-hidden shadow-inner">
               <div 
-                className="bg-blue-600 h-3 rounded-xl transition-all duration-300" 
+                className="bg-gradient-to-r from-blue-500 to-green-500 h-4 rounded-xl transition-all duration-300 flex items-center justify-center"
                 style={{ width: `${uploadProgress}%` }}
-              ></div>
-              <p className="text-sm text-gray-600 mt-2 text-center">
-                Uploading: {uploadProgress}%
+              >
+                <span className="text-white text-xs font-bold">
+                  {uploadProgress}%
+                </span>
+              </div>
+              <p className="text-sm text-gray-600 mt-2 text-center font-medium">
+                Uploading files... {uploadProgress}% complete
               </p>
             </div>
           )}
 
           {/* Job Info & Controls */}
-          <div className="flex items-center justify-between gap-4 mt-6 p-4 bg-blue-50 rounded-xl border border-blue-200">
-            <div className="space-y-2">
+          <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 mt-6 p-6 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-blue-200 shadow-sm">
+            <div className="space-y-3 flex-1">
               <p className="text-sm text-gray-700">
                 <span className="font-semibold">Job ID:</span>{" "}
-                <span className="font-mono bg-white px-2 py-1 rounded border">
+                <span className="font-mono bg-white px-3 py-1.5 rounded-lg border border-gray-300 text-blue-700">
                   {customerId || "—"}
                 </span>
               </p>
               <p className="text-sm text-gray-700">
                 <span className="font-semibold">Elapsed Time:</span>{" "}
-                <span className="font-mono bg-white px-2 py-1 rounded border">
+                <span className="font-mono bg-white px-3 py-1.5 rounded-lg border border-gray-300">
                   {formatElapsedTime(elapsedSeconds)}
                 </span>
               </p>
               {currentProgress && (
                 <p className="text-sm text-gray-700">
                   <span className="font-semibold">Progress:</span>{" "}
-                  <span className="font-mono bg-white px-2 py-1 rounded border">
-                    {currentProgress.submitted}/{currentProgress.total} workers
+                  <span className="font-mono bg-white px-3 py-1.5 rounded-lg border border-gray-300 text-green-700">
+                    {currentProgress.submitted}/{currentProgress.total} workers ({currentProgress.percentage}%)
                   </span>
                 </p>
               )}
@@ -915,6 +1090,7 @@ const ClientPage = () => {
               isCancelled={isCancelled}
               hasCustomerId={!!customerId}
               serverLive={serverLive}
+              canSubmit={canSubmit}
               onSendFiles={sendFile}
               onCancel={handleCancel}
               onDownload={downloadResultsZip}
@@ -928,15 +1104,22 @@ const ClientPage = () => {
 
       {/* Ended Popup */}
       {showEndedPopup && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-6 w-96 text-center shadow-2xl">
-            <h4 className="text-xl font-semibold mb-4 text-gray-800">Job Ended</h4>
-            <p className="mb-4 text-gray-600">
-              {isCancelled ? "The job has been cancelled." : "The job has been completed."}
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-fade-in">
+          <div className="bg-white rounded-xl p-6 w-96 text-center shadow-2xl animate-scale-in">
+            <div className="text-4xl mb-4">
+              {isCancelled ? "❌" : "🎉"}
+            </div>
+            <h4 className="text-xl font-semibold mb-4 text-gray-800">
+              {isCancelled ? "Job Cancelled" : "Job Completed"}
+            </h4>
+            <p className="mb-6 text-gray-600">
+              {isCancelled 
+                ? "The job has been cancelled successfully. No results will be available." 
+                : "The job has been completed successfully! You can now download the results."}
             </p>
             <button
               onClick={() => setShowEndedPopup(false)}
-              className="px-5 py-2 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium"
+              className="w-full px-5 py-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium"
             >
               OK
             </button>
